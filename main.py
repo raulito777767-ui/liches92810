@@ -9,22 +9,23 @@ import chess.polyglot
 import berserk
 
 # ==========================================
-# 1. SERVIDOR HTTP (Keep-Alive para Render Free)
+# 1. SERVIDOR HTTP (Evita que Render se duerma)
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Lichess Bot Engine (>2000 ELO) en ejecución", 200
+    return "MackBot Engine (>2000 ELO) está online y jugando en Lichess.", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
+# Iniciamos el servidor en un hilo secundario
 threading.Thread(target=run_flask, daemon=True).start()
 
 # ==========================================
-# 2. CONFIGURACIÓN DEL MOTOR Y EVALUACIÓN
+# 2. MOTOR DE AJEDREZ Y EVALUACIÓN
 # ==========================================
 
 BOOK_PATH = os.path.join(os.path.dirname(__file__), "book.bin")
@@ -38,7 +39,7 @@ PIECE_VALUES = {
     chess.KING: 20000
 }
 
-# Piece-Square Tables (PST)
+# Tablas de Posición (Piece-Square Tables)
 pawntable = [
     0,  0,  0,  0,  0,  0,  0,  0,
     50, 50, 50, 50, 50, 50, 50, 50,
@@ -49,7 +50,6 @@ pawntable = [
      5, 10, 10,-20,-20, 10, 10,  5,
      0,  0,  0,  0,  0,  0,  0,  0
 ]
-
 knightstable = [
     -50,-40,-30,-30,-30,-30,-40,-50,
     -40,-20,  0,  0,  0,  0,-20,-40,
@@ -60,7 +60,6 @@ knightstable = [
     -40,-20,  0,  5,  5,  0,-20,-40,
     -50,-40,-30,-30,-30,-30,-40,-50,
 ]
-
 bishopstable = [
     -20,-10,-10,-10,-10,-10,-10,-20,
     -10,  0,  0,  0,  0,  0,  0,-10,
@@ -71,7 +70,6 @@ bishopstable = [
     -10,  5,  0,  0,  0,  0,  5,-10,
     -20,-10,-10,-10,-10,-10,-10,-20,
 ]
-
 rookstable = [
       0,  0,  0,  0,  0,  0,  0,  0,
       5, 10, 10, 10, 10, 10, 10,  5,
@@ -82,7 +80,6 @@ rookstable = [
      -5,  0,  0,  0,  0,  0,  0, -5,
       0,  0,  0,  5,  5,  0,  0,  0
 ]
-
 queenstable = [
     -20,-10,-10, -5, -5,-10,-10,-20,
     -10,  0,  0,  0,  0,  0,  0,-10,
@@ -93,7 +90,6 @@ queenstable = [
     -10,  0,  5,  0,  0,  0,  0,-10,
     -20,-10,-10, -5, -5,-10,-10,-20
 ]
-
 kingstable = [
     -30,-40,-40,-50,-50,-40,-40,-30,
     -30,-40,-40,-50,-50,-40,-40,-30,
@@ -118,23 +114,14 @@ def evaluate_board(board: chess.Board) -> int:
             val = PIECE_VALUES[piece.piece_type]
             sq = square if piece.color == chess.WHITE else chess.square_mirror(square)
             
-            if piece.piece_type == chess.PAWN:
-                val += pawntable[sq]
-            elif piece.piece_type == chess.KNIGHT:
-                val += knightstable[sq]
-            elif piece.piece_type == chess.BISHOP:
-                val += bishopstable[sq]
-            elif piece.piece_type == chess.ROOK:
-                val += rookstable[sq]
-            elif piece.piece_type == chess.QUEEN:
-                val += queenstable[sq]
-            elif piece.piece_type == chess.KING:
-                val += kingstable[sq]
+            if piece.piece_type == chess.PAWN: val += pawntable[sq]
+            elif piece.piece_type == chess.KNIGHT: val += knightstable[sq]
+            elif piece.piece_type == chess.BISHOP: val += bishopstable[sq]
+            elif piece.piece_type == chess.ROOK: val += rookstable[sq]
+            elif piece.piece_type == chess.QUEEN: val += queenstable[sq]
+            elif piece.piece_type == chess.KING: val += kingstable[sq]
 
-            if piece.color == chess.WHITE:
-                evaluation += val
-            else:
-                evaluation -= val
+            evaluation += val if piece.color == chess.WHITE else -val
 
     return evaluation
 
@@ -145,9 +132,15 @@ def order_moves(board: chess.Board, moves):
             attacker = board.piece_at(move.from_square)
             victim = board.piece_at(move.to_square)
             if attacker and victim:
+                # MVV-LVA (Ej: Peón captura Reina da muchos puntos)
                 score += 10 * PIECE_VALUES[victim.piece_type] - PIECE_VALUES[attacker.piece_type]
+                
+                # Penalización severa: No sacrificar piezas valiosas si la casilla está defendida
+                if PIECE_VALUES[attacker.piece_type] > PIECE_VALUES[victim.piece_type]:
+                    if board.is_attacked_by(not board.turn, move.to_square):
+                        score -= 2000
             else:
-                score += 500
+                score += 500 # Captura al paso (En passant)
         if board.gives_check(move):
             score += 300
         return score
@@ -193,8 +186,7 @@ def minimax(board: chess.Board, depth: int, alpha: int, beta: int, is_maximizing
             board.pop()
             max_eval = max(max_eval, eval)
             alpha = max(alpha, eval)
-            if beta <= alpha:
-                break
+            if beta <= alpha: break
         return max_eval
     else:
         min_eval = math.inf
@@ -204,55 +196,40 @@ def minimax(board: chess.Board, depth: int, alpha: int, beta: int, is_maximizing
             board.pop()
             min_eval = min(min_eval, eval)
             beta = min(beta, eval)
-            if beta <= alpha:
-                break
+            if beta <= alpha: break
         return min_eval
 
 def get_opening_move_polyglot(board: chess.Board) -> chess.Move | None:
     if not os.path.exists(BOOK_PATH):
         return None
-
     try:
         with chess.polyglot.open_reader(BOOK_PATH) as reader:
             entries = list(reader.find_all(board))
-            if entries:
-                entry = random.choice(entries)
-                return entry.move
+            if entries: return random.choice(entries).move
     except Exception as e:
-        print(f"Error al leer book.bin: {e}")
-    
+        print(f"Error libro de aperturas: {e}", flush=True)
     return None
 
-def calculate_dynamic_depth(board: chess.Board, my_time_ms: int, my_inc_ms: int) -> int:
-    """Calcula la profundidad de búsqueda en función del tiempo restante en el reloj."""
+def calculate_dynamic_depth(board: chess.Board, my_time_ms: int) -> int:
     time_left_sec = my_time_ms / 1000.0
-    inc_sec = my_inc_ms / 1000.0
-
-    # Apuros de tiempo drásticos (< 10 segundos restantes)
-    if time_left_sec < 10:
-        return 2
-    # Tiempo medio (10 a 30 segundos)
-    elif time_left_sec < 30:
-        return 3
-    # Tiempo holgado (> 30 segundos) o incrementos generosos
-    elif time_left_sec > 30 or inc_sec >= 3:
-        num_pieces = len(board.piece_map())
-        # Reducir a 3 en el medio juego con muchas piezas para evitar apurar el reloj
-        return 4 if num_pieces <= 18 else 3
+    if time_left_sec < 15:
+        return 2  # Apuros extremos: respuesta casi instantánea
+    elif time_left_sec < 45:
+        return 3  # Apuros medios
     else:
-        return 3
+        num_pieces = len(board.piece_map())
+        # Si hay muchas piezas, max prof 3 para evitar colgar Render
+        return 4 if num_pieces <= 16 else 3
 
-def get_best_move(board: chess.Board, my_time_ms: int = 180000, my_inc_ms: int = 2000) -> chess.Move:
-    # 1. Consultar libro de aperturas en las primeras 15 jugadas
+def get_best_move(board: chess.Board, my_time_ms: int = 180000) -> chess.Move:
     if board.fullmove_number <= 15:
         book_move = get_opening_move_polyglot(board)
         if book_move:
-            print("  📖 Jugada ejecutada desde book.bin")
+            print("  📖 Jugada de libro (book.bin)", flush=True)
             return book_move
 
-    # 2. Calcular profundidad dinámica basada en reloj
-    depth = calculate_dynamic_depth(board, my_time_ms, my_inc_ms)
-    print(f"  🧠 Calculando jugada a profundidad {depth} (Tiempo restante: {my_time_ms/1000:.1f}s)")
+    depth = calculate_dynamic_depth(board, my_time_ms)
+    print(f"  🧠 Calculando... Profundidad: {depth} | Reloj: {my_time_ms/1000:.1f}s", flush=True)
 
     best_move = None
     is_white = (board.turn == chess.WHITE)
@@ -281,27 +258,29 @@ def get_best_move(board: chess.Board, my_time_ms: int = 180000, my_inc_ms: int =
     return best_move if best_move else legal_moves[0]
 
 # ==========================================
-# 3. CONEXIÓN Y DESAFÍOS AUTÓNOMOS
+# 3. CONEXIÓN A LICHESS Y DESAFÍOS AUTÓNOMOS
 # ==========================================
 
 TOKEN = os.environ.get("LICHESS_TOKEN")
 if not TOKEN:
-    raise ValueError("LICHESS_TOKEN no configurado")
+    raise ValueError("⚠️ LICHESS_TOKEN no está configurado en las variables de entorno.")
 
 session = berserk.TokenSession(TOKEN)
 client = berserk.Client(session=session)
 
-my_profile = client.account.get()
-my_id = my_profile['id']
-my_username = my_profile['username']
+try:
+    my_profile = client.account.get()
+    my_id = my_profile['id']
+    my_username = my_profile['username']
+except Exception as e:
+    raise RuntimeError(f"⚠️ Error al conectar con Lichess. Revisa el TOKEN. Detalles: {e}")
 
 is_in_game = False
 is_rated_turn = True
 
 def auto_challenge_loop():
     global is_in_game, is_rated_turn
-    
-    print("Iniciando gestor automático de desafíos a bots...")
+    print("🤖 Gestor de Auto-Desafíos activado...", flush=True)
     time.sleep(10)
     
     while True:
@@ -311,43 +290,39 @@ def auto_challenge_loop():
                 available_bots = [b for b in online_bots if b.get('id') != my_id]
 
                 if available_bots:
-                    target_bot = random.choice(available_bots)
-                    target_id = target_bot.get('id')
+                    target = random.choice(available_bots)
+                    target_id = target.get('id')
+                    mode_str = "Clasificada" if is_rated_turn else "Amistosa"
                     
-                    rated_mode = is_rated_turn
-                    mode_str = "Clasificada (Rated)" if rated_mode else "Amistosa (Casual)"
-                    
-                    print(f"Enviando desafío {mode_str} al bot: {target_id}")
-                    
+                    print(f"⚔️ Retando a {target_id} ({mode_str})...", flush=True)
                     try:
                         client.challenges.create(
                             username=target_id,
-                            rated=rated_mode,
+                            rated=is_rated_turn,
                             clock_limit=180,
                             clock_increment=2,
-                            color='random',
-                            variant='standard'
+                            color='random'
                         )
                         is_rated_turn = not is_rated_turn
-                    except Exception as err:
-                        print(f"Error al enviar reto a {target_id}: {err}")
-
-                    time.sleep(40)
+                    except berserk.exceptions.ResponseError as err:
+                        # Ignorar silenciosamente errores de límite de retos diarios
+                        pass
+                    
+                    time.sleep(40) # Espera a ver si aceptan antes de mandar otro
                 else:
                     time.sleep(15)
             else:
-                time.sleep(10)
-        except Exception as e:
-            print(f"Error en bucle de auto-desafío: {e}")
+                time.sleep(10) # En partida, revisar menos seguido
+        except Exception:
             time.sleep(20)
 
 threading.Thread(target=auto_challenge_loop, daemon=True).start()
 
 # ==========================================
-# 4. BUCLE PRINCIPAL DE EVENTOS
+# 4. BUCLE PRINCIPAL (Streaming y Partidas)
 # ==========================================
 
-print(f"Bot listo y activo como: {my_username}")
+print(f"✅ Bot listo y conectado como: {my_username}", flush=True)
 
 while True:
     try:
@@ -355,73 +330,80 @@ while True:
             event_type = event.get('type')
 
             if event_type == 'challenge':
-                challenge = event['challenge']
-                challenge_id = challenge['id']
-                variant = challenge['variant']['key']
-                challenger_id = challenge.get('challenger', {}).get('id')
+                challenge_id = event['challenge']['id']
+                challenger_id = event['challenge'].get('challenger', {}).get('id')
+                variant = event['challenge']['variant']['key']
 
-                if challenger_id == my_id:
-                    continue
+                if challenger_id == my_id: continue
 
                 if variant == 'standard':
                     try:
                         client.bots.accept_challenge(challenge_id)
-                        print(f"Reto entrante aceptado: {challenge_id}")
-                    except berserk.exceptions.ResponseError as e:
-                        print(f"No se pudo aceptar el reto {challenge_id}: {e}")
+                        print(f"🤝 Reto aceptado: {challenge_id}", flush=True)
+                    except Exception: pass
                 else:
-                    try:
-                        client.bots.decline_challenge(challenge_id, reason='variant')
-                    except berserk.exceptions.ResponseError:
-                        pass
+                    try: client.bots.decline_challenge(challenge_id, reason='variant')
+                    except Exception: pass
 
             elif event_type == 'gameStart':
                 game_id = event['game']['gameId']
                 is_in_game = True
-                print(f"Partida iniciada: {game_id}")
+                print(f"🎮 Partida iniciada: https://lichess.org/{game_id}", flush=True)
                 
                 board = chess.Board()
 
                 try:
-                    for game_event in client.bots.stream_game_state(game_id):
-                        if game_event['type'] == 'gameFull':
-                            white_id = game_event['white'].get('id')
-                            is_white = (white_id == my_id)
-                            state = game_event['state']
-                        elif game_event['type'] == 'gameState':
-                            state = game_event
-                        else:
-                            continue
+                    game_active = True
+                    while game_active:
+                        try:
+                            for game_event in client.bots.stream_game_state(game_id):
+                                if game_event['type'] == 'gameFull':
+                                    white_id = game_event['white'].get('id')
+                                    is_white = (white_id == my_id)
+                                    state = game_event['state']
+                                elif game_event['type'] == 'gameState':
+                                    state = game_event
+                                else:
+                                    continue
 
-                        moves = state['moves'].split() if state['moves'] else []
-                        board.reset()
-                        for move in moves:
-                            board.push(chess.Move.from_uci(move))
+                                moves = state['moves'].split() if state['moves'] else []
+                                board.reset()
+                                for move in moves: board.push(chess.Move.from_uci(move))
 
-                        if state['status'] != 'started' or board.is_game_over():
-                            print(f"Partida finalizada: {game_id}")
-                            break
+                                if state['status'] != 'started' or board.is_game_over():
+                                    print(f"🏁 Partida finalizada: {game_id}", flush=True)
+                                    game_active = False
+                                    break
 
-                        is_my_turn = (board.turn == chess.WHITE and is_white) or (board.turn == chess.BLACK and not is_white)
+                                is_my_turn = (board.turn == chess.WHITE and is_white) or (board.turn == chess.BLACK and not is_white)
 
-                        if is_my_turn:
-                            start_time = time.time()
-                            
-                            # Extraer tiempo e incremento restantes en milisegundos desde Lichess
-                            my_time_ms = state.get('wtime', 180000) if is_white else state.get('btime', 180000)
-                            my_inc_ms = state.get('winc', 2000) if is_white else state.get('binc', 2000)
-                            
-                            best_move = get_best_move(board, my_time_ms=my_time_ms, my_inc_ms=my_inc_ms)
-                            elapsed = time.time() - start_time
-                            
+                                if is_my_turn:
+                                    start_time = time.time()
+                                    my_time_ms = state.get('wtime', 180000) if is_white else state.get('btime', 180000)
+                                    
+                                    best_move = get_best_move(board, my_time_ms=my_time_ms)
+                                    elapsed = time.time() - start_time
+                                    
+                                    try:
+                                        client.bots.make_move(game_id, best_move.uci())
+                                        print(f"  👉 Jugada enviada: {best_move.uci()} (Tiempo cálculo: {elapsed:.2f}s)", flush=True)
+                                    except Exception as e:
+                                        print(f"⚠️ Error enviando mov: {e}", flush=True)
+                        
+                        except Exception as stream_err:
+                            # Reconexión interna blindada para la partida activa
+                            print(f"🔄 Reconectando stream de partida... ({stream_err})", flush=True)
+                            time.sleep(1)
                             try:
-                                client.bots.make_move(game_id, best_move.uci())
-                                print(f"Jugada enviada [{game_id}]: {best_move.uci()} (en {elapsed:.2f}s)")
-                            except berserk.exceptions.ResponseError as e:
-                                print(f"Error enviando movimiento: {e}")
+                                # Verificar si el juego sigue existiendo en el servidor
+                                current_game = client.games.export(game_id)
+                                if current_game.get('status') != 'started':
+                                    game_active = False
+                            except Exception:
+                                game_active = False
                 finally:
                     is_in_game = False
 
     except Exception as err:
-        print(f"Desconexión del stream de Lichess ({err}). Reconectando en 5 segundos...")
+        print(f"🔌 Desconexión general de Lichess. Reconectando en 5s... ({err})", flush=True)
         time.sleep(5)
