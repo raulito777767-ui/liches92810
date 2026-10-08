@@ -108,8 +108,8 @@ kingstable = [
 def evaluate_board(board: chess.Board) -> int:
     if board.is_checkmate():
         return -99999 if board.turn == chess.WHITE else 99999
-    if board.is_stalemate() or board.is_insufficient_material() or board.is_threefold_repetition():
-        return 0
+    if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_threefold_repetition():
+     return 0
 
     evaluation = 0
     for square in chess.SQUARES:
