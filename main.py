@@ -1,425 +1,816 @@
+"""
+MackBot ULTIMATE
+================
+- Motor principal: Stockfish (UCI) si está disponible  -> >3000 ELO, gestiona el reloj solo.
+- Motor de respaldo: motor propio en Python (negamax/PVS, profundización iterativa,
+  tabla de transposición, null-move, LMR, killers/history, quiescence, gestión de tiempo).
+- Partidas en hilos (el stream de eventos nunca se bloquea).
+- Libro de aperturas Polyglot opcional (book.bin).
+"""
 import os
+import sys
 import time
-import math
 import random
+import shutil
 import threading
 import datetime
-from flask import Flask
+import urllib.request
+
 import chess
+import chess.engine
 import chess.polyglot
-import berserk
 
-# ==========================================
-# 1. SERVIDOR HTTP (Evita que Render se duerma)
-# ==========================================
-app = Flask(__name__)
+# ======================================================================
+# CONFIGURACIÓN (variables de entorno)
+# ======================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BOOK_PATH = os.environ.get("BOOK_PATH", os.path.join(BASE_DIR, "book.bin"))
+STOCKFISH_PATH = os.environ.get("STOCKFISH_PATH", "")
+SF_THREADS = int(os.environ.get("SF_THREADS", "1"))
+SF_HASH = int(os.environ.get("SF_HASH", "64"))
+MOVE_OVERHEAD = int(os.environ.get("MOVE_OVERHEAD", "500"))   # ms de latencia de red/servidor
+MAX_GAMES = int(os.environ.get("MAX_GAMES", "1"))
+AUTO_CHALLENGE = os.environ.get("AUTO_CHALLENGE", "1") == "1"
+RATED = os.environ.get("RATED", "1") == "1"
+TC_TIME = int(os.environ.get("TC_TIME", "180"))
+TC_INC = int(os.environ.get("TC_INC", "2"))
+BOOK_MAX_FULLMOVES = 12
 
-@app.route('/')
-def home():
-    return "MackBot Engine (>2000 ELO) está online y jugando en Lichess.", 200
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+def log(*a):
+    print(*a, flush=True)
 
-threading.Thread(target=run_flask, daemon=True).start()
 
-# ==========================================
-# 2. MOTOR DE AJEDREZ, CACHÉ Y EVALUACIÓN
-# ==========================================
+# ======================================================================
+# UTILIDADES
+# ======================================================================
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
-BOOK_PATH = os.path.join(os.path.dirname(__file__), "book.bin")
 
-PIECE_VALUES = {
-    chess.PAWN: 100,
-    chess.KNIGHT: 320,
-    chess.BISHOP: 330,
-    chess.ROOK: 500,
-    chess.QUEEN: 900,
-    chess.KING: 20000
-}
-
-# Tablas de Posición (Piece-Square Tables)
-pawntable = [
-    0,  0,  0,  0,  0,  0,  0,  0,
-    50, 50, 50, 50, 50, 50, 50, 50,
-    10, 10, 20, 30, 30, 20, 10, 10,
-     5,  5, 10, 25, 25, 10,  5,  5,
-     0,  0,  0, 20, 20,  0,  0,  0,
-     5, -5,-10,  0,  0,-10, -5,  5,
-     5, 10, 10,-20,-20, 10, 10,  5,
-     0,  0,  0,  0,  0,  0,  0,  0
-]
-knightstable = [
-    -50,-40,-30,-30,-30,-30,-40,-50,
-    -40,-20,  0,  0,  0,  0,-20,-40,
-    -30,  0, 10, 15, 15, 10,  0,-30,
-    -30,  5, 15, 20, 20, 15,  5,-30,
-    -30,  0, 15, 20, 20, 15,  0,-30,
-    -30,  5, 10, 15, 15, 10,  5,-30,
-    -40,-20,  0,  5,  5,  0,-20,-40,
-    -50,-40,-30,-30,-30,-30,-40,-50,
-]
-bishopstable = [
-    -20,-10,-10,-10,-10,-10,-10,-20,
-    -10,  0,  0,  0,  0,  0,  0,-10,
-    -10,  0,  5, 10, 10,  5,  0,-10,
-    -10,  5,  5, 10, 10,  5,  5,-10,
-    -10,  0, 10, 10, 10, 10,  0,-10,
-    -10, 10, 10, 10, 10, 10, 10,-10,
-    -10,  5,  0,  0,  0,  0,  5,-10,
-    -20,-10,-10,-10,-10,-10,-10,-20,
-]
-rookstable = [
-      0,  0,  0,  0,  0,  0,  0,  0,
-      5, 10, 10, 10, 10, 10, 10,  5,
-     -5,  0,  0,  0,  0,  0,  0, -5,
-     -5,  0,  0,  0,  0,  0,  0, -5,
-     -5,  0,  0,  0,  0,  0,  0, -5,
-     -5,  0,  0,  0,  0,  0,  0, -5,
-     -5,  0,  0,  0,  0,  0,  0, -5,
-      0,  0,  0,  5,  5,  0,  0,  0
-]
-queenstable = [
-    -20,-10,-10, -5, -5,-10,-10,-20,
-    -10,  0,  0,  0,  0,  0,  0,-10,
-    -10,  0,  5,  5,  5,  5,  0,-10,
-     -5,  0,  5,  5,  5,  5,  0, -5,
-      0,  0,  5,  5,  5,  5,  0, -5,
-    -10,  5,  5,  5,  5,  5,  0,-10,
-    -10,  0,  5,  0,  0,  0,  0,-10,
-    -20,-10,-10, -5, -5,-10,-10,-20
-]
-kingstable = [
-    -30,-40,-40,-50,-50,-40,-40,-30,
-    -30,-40,-40,-50,-50,-40,-40,-30,
-    -30,-40,-40,-50,-50,-40,-40,-30,
-    -30,-40,-40,-50,-50,-40,-40,-30,
-    -20,-30,-30,-40,-40,-30,-30,-20,
-    -10,-20,-20,-20,-20,-20,-20,-10,
-     20, 20,  0,  0,  0,  0, 20, 20,
-     20, 30, 10,  0,  0, 10, 30, 20
-]
-
-# Caché de Transposición para acelerar el Minimax sin perder profundidad
-transposition_table = {}
-
-def evaluate_board(board: chess.Board) -> int:
-    if board.is_checkmate():
-        return -99999 if board.turn == chess.WHITE else 99999
-    if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_threefold_repetition():
-        return 0
-
-    evaluation = 0
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece is not None:
-            val = PIECE_VALUES[piece.piece_type]
-            sq = square if piece.color == chess.WHITE else chess.square_mirror(square)
-            
-            if piece.piece_type == chess.PAWN: val += pawntable[sq]
-            elif piece.piece_type == chess.KNIGHT: val += knightstable[sq]
-            elif piece.piece_type == chess.BISHOP: val += bishopstable[sq]
-            elif piece.piece_type == chess.ROOK: val += rookstable[sq]
-            elif piece.piece_type == chess.QUEEN: val += queenstable[sq]
-            elif piece.piece_type == chess.KING: val += kingstable[sq]
-
-            evaluation += val if piece.color == chess.WHITE else -val
-
-    return evaluation
-
-def order_moves(board: chess.Board, moves):
-    def score_move(move):
-        score = 0
-        if board.is_capture(move):
-            attacker = board.piece_at(move.from_square)
-            victim = board.piece_at(move.to_square)
-            if attacker and victim:
-                score += 10 * PIECE_VALUES[victim.piece_type] - PIECE_VALUES[attacker.piece_type]
-                # Penalización severa para evitar colgar piezas en casillas defendidas
-                if PIECE_VALUES[attacker.piece_type] > PIECE_VALUES[victim.piece_type]:
-                    if board.is_attacked_by(not board.turn, move.to_square):
-                        score -= 2000
-            else:
-                score += 500
-        if board.gives_check(move):
-            score += 300
-        return score
-
-    return sorted(moves, key=score_move, reverse=True)
-
-def quiescence_search(board: chess.Board, alpha: int, beta: int) -> int:
-    stand_pat = evaluate_board(board)
-    if board.turn == chess.BLACK:
-        stand_pat = -stand_pat
-
-    if stand_pat >= beta:
-        return beta
-    if alpha < stand_pat:
-        alpha = stand_pat
-
-    captures = [m for m in board.legal_moves if board.is_capture(m)]
-    captures = order_moves(board, captures)
-
-    for move in captures:
-        board.push(move)
-        score = -quiescence_search(board, -beta, -alpha)
-        board.pop()
-
-        if score >= beta:
-            return beta
-        if score > alpha:
-            alpha = score
-
-    return alpha
-
-def minimax(board: chess.Board, depth: int, alpha: int, beta: int, is_maximizing: bool) -> int:
-    board_fen = board.fen()
-    cache_key = (board_fen, depth, is_maximizing)
-    
-    if cache_key in transposition_table:
-        return transposition_table[cache_key]
-
-    if depth == 0 or board.is_game_over():
-        val = quiescence_search(board, alpha, beta) if is_maximizing else -quiescence_search(board, -beta, -alpha)
-        transposition_table[cache_key] = val
-        return val
-
-    legal_moves = order_moves(board, list(board.legal_moves))
-
-    if is_maximizing:
-        max_eval = -math.inf
-        for move in legal_moves:
-            board.push(move)
-            eval = minimax(board, depth - 1, alpha, beta, False)
-            board.pop()
-            max_eval = max(max_eval, eval)
-            alpha = max(alpha, eval)
-            if beta <= alpha: break
-        transposition_table[cache_key] = max_eval
-        return max_eval
-    else:
-        min_eval = math.inf
-        for move in legal_moves:
-            board.push(move)
-            eval = minimax(board, depth - 1, alpha, beta, True)
-            board.pop()
-            min_eval = min(min_eval, eval)
-            beta = min(beta, eval)
-            if beta <= alpha: break
-        transposition_table[cache_key] = min_eval
-        return min_eval
-
-def get_opening_move_polyglot(board: chess.Board) -> chess.Move | None:
-    if not os.path.exists(BOOK_PATH):
+def to_ms(x):
+    """Convierte int / float / timedelta / datetime (lo que devuelva berserk) a milisegundos."""
+    if x is None:
         return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, datetime.timedelta):
+        return x.total_seconds() * 1000.0
+    if isinstance(x, datetime.datetime):
+        if x.tzinfo is None:
+            x = x.replace(tzinfo=datetime.timezone.utc)
+        return (x - _EPOCH).total_seconds() * 1000.0
     try:
-        with chess.polyglot.open_reader(BOOK_PATH) as reader:
-            entries = list(reader.find_all(board))
-            if entries: return random.choice(entries).move
-    except Exception as e:
-        print(f"Error libro de aperturas: {e}", flush=True)
+        return float(x)
+    except Exception:
+        return None
+
+
+def time_budget(time_left_ms, inc_ms, ply):
+    """Devuelve (tiempo_suave, tiempo_duro) en segundos."""
+    t = time_left_ms / 1000.0
+    inc = inc_ms / 1000.0
+    avail = max(0.05, t - MOVE_OVERHEAD / 1000.0)
+    moves_to_go = max(18, 45 - ply // 2)
+    soft = avail / moves_to_go + inc * 0.8
+    soft = max(0.05, min(soft, avail * 0.25))
+    hard = max(soft, min(soft * 3.0, avail * 0.40))
+    return soft, hard
+
+
+# ======================================================================
+# MOTOR PROPIO EN PYTHON (respaldo si no hay Stockfish)
+# ======================================================================
+PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING
+VAL = {PAWN: 100, KNIGHT: 320, BISHOP: 330, ROOK: 500, QUEEN: 900, KING: 20000}
+MAT_MG = {PAWN: 100, KNIGHT: 320, BISHOP: 330, ROOK: 500, QUEEN: 900, KING: 0}
+MAT_EG = {PAWN: 115, KNIGHT: 310, BISHOP: 320, ROOK: 520, QUEEN: 900, KING: 0}
+
+# Tablas (vista de blancas: índice 0 = a8)
+_P = [0, 0, 0, 0, 0, 0, 0, 0,
+      50, 50, 50, 50, 50, 50, 50, 50,
+      10, 10, 20, 30, 30, 20, 10, 10,
+      5, 5, 10, 25, 25, 10, 5, 5,
+      0, 0, 0, 20, 20, 0, 0, 0,
+      5, -5, -10, 0, 0, -10, -5, 5,
+      5, 10, 10, -20, -20, 10, 10, 5,
+      0, 0, 0, 0, 0, 0, 0, 0]
+_N = [-50, -40, -30, -30, -30, -30, -40, -50,
+      -40, -20, 0, 0, 0, 0, -20, -40,
+      -30, 0, 10, 15, 15, 10, 0, -30,
+      -30, 5, 15, 20, 20, 15, 5, -30,
+      -30, 0, 15, 20, 20, 15, 0, -30,
+      -30, 5, 10, 15, 15, 10, 5, -30,
+      -40, -20, 0, 5, 5, 0, -20, -40,
+      -50, -40, -30, -30, -30, -30, -40, -50]
+_B = [-20, -10, -10, -10, -10, -10, -10, -20,
+      -10, 0, 0, 0, 0, 0, 0, -10,
+      -10, 0, 5, 10, 10, 5, 0, -10,
+      -10, 5, 5, 10, 10, 5, 5, -10,
+      -10, 0, 10, 10, 10, 10, 0, -10,
+      -10, 10, 10, 10, 10, 10, 10, -10,
+      -10, 5, 0, 0, 0, 0, 5, -10,
+      -20, -10, -10, -10, -10, -10, -10, -20]
+_R = [0, 0, 0, 0, 0, 0, 0, 0,
+      5, 10, 10, 10, 10, 10, 10, 5,
+      -5, 0, 0, 0, 0, 0, 0, -5,
+      -5, 0, 0, 0, 0, 0, 0, -5,
+      -5, 0, 0, 0, 0, 0, 0, -5,
+      -5, 0, 0, 0, 0, 0, 0, -5,
+      -5, 0, 0, 0, 0, 0, 0, -5,
+      0, 0, 0, 5, 5, 0, 0, 0]
+_Q = [-20, -10, -10, -5, -5, -10, -10, -20,
+      -10, 0, 0, 0, 0, 0, 0, -10,
+      -10, 0, 5, 5, 5, 5, 0, -10,
+      -5, 0, 5, 5, 5, 5, 0, -5,
+      0, 0, 5, 5, 5, 5, 0, -5,
+      -10, 5, 5, 5, 5, 5, 0, -10,
+      -10, 0, 5, 0, 0, 0, 0, -10,
+      -20, -10, -10, -5, -5, -10, -10, -20]
+_K_MG = [-30, -40, -40, -50, -50, -40, -40, -30,
+         -30, -40, -40, -50, -50, -40, -40, -30,
+         -30, -40, -40, -50, -50, -40, -40, -30,
+         -30, -40, -40, -50, -50, -40, -40, -30,
+         -20, -30, -30, -40, -40, -30, -30, -20,
+         -10, -20, -20, -20, -20, -20, -20, -10,
+         20, 20, 0, 0, 0, 0, 20, 20,
+         20, 30, 10, 0, 0, 10, 30, 20]
+_K_EG = [-50, -40, -30, -20, -20, -30, -40, -50,
+         -30, -20, -10, 0, 0, -10, -20, -30,
+         -30, -10, 20, 30, 30, 20, -10, -30,
+         -30, -10, 30, 40, 40, 30, -10, -30,
+         -30, -10, 30, 40, 40, 30, -10, -30,
+         -30, -10, 20, 30, 30, 20, -10, -30,
+         -30, -30, 0, 0, 0, 0, -30, -30,
+         -50, -30, -30, -30, -30, -30, -30, -50]
+_P_EG = []
+for _row in (0, 90, 60, 40, 25, 15, 10, 0):
+    _P_EG += [_row] * 8
+
+_PST_MG = {PAWN: _P, KNIGHT: _N, BISHOP: _B, ROOK: _R, QUEEN: _Q, KING: _K_MG}
+_PST_EG = {PAWN: _P_EG, KNIGHT: _N, BISHOP: _B, ROOK: _R, QUEEN: _Q, KING: _K_EG}
+
+# MG[color][piece_type][square] con color True=blancas
+MG = {True: {}, False: {}}
+EG = {True: {}, False: {}}
+for _c in (True, False):
+    for _pt in range(1, 7):
+        MG[_c][_pt] = [MAT_MG[_pt] + _PST_MG[_pt][(s ^ 56) if _c else s] for s in range(64)]
+        EG[_c][_pt] = [MAT_EG[_pt] + _PST_EG[_pt][(s ^ 56) if _c else s] for s in range(64)]
+
+PHASE_W = {PAWN: 0, KNIGHT: 1, BISHOP: 1, ROOK: 2, QUEEN: 4, KING: 0}
+PASSED_BONUS_MG = [0, 5, 10, 20, 40, 70, 110, 0]
+PASSED_BONUS_EG = [0, 10, 20, 40, 75, 120, 180, 0]
+FILES = [chess.BB_FILES[f] for f in range(8)]
+
+# Máscaras de peones pasados y escudo del rey
+PASSED_MASK = {True: [0] * 64, False: [0] * 64}
+SHIELD_MASK = {True: [0] * 64, False: [0] * 64}
+for _sq in range(64):
+    _f, _r = chess.square_file(_sq), chess.square_rank(_sq)
+    for _c in (True, False):
+        m = 0
+        rng = range(_r + 1, 8) if _c else range(0, _r)
+        for rr in rng:
+            for ff in (_f - 1, _f, _f + 1):
+                if 0 <= ff < 8:
+                    m |= 1 << chess.square(ff, rr)
+        PASSED_MASK[_c][_sq] = m
+        s = 0
+        step = (1, 2) if _c else (-1, -2)
+        for d in step:
+            rr = _r + d
+            if 0 <= rr < 8:
+                for ff in (_f - 1, _f, _f + 1):
+                    if 0 <= ff < 8:
+                        s |= 1 << chess.square(ff, rr)
+        SHIELD_MASK[_c][_sq] = s
+
+_popcount = lambda x: bin(x).count("1")
+
+
+def evaluate(board: chess.Board) -> int:
+    """Evaluación desde el punto de vista del bando que mueve (centipeones)."""
+    mg = eg = 0
+    phase = 0
+    for color, sign in ((True, 1), (False, -1)):
+        own_pawns = board.pieces_mask(PAWN, color)
+        enemy_pawns = board.pieces_mask(PAWN, not color)
+        m = e = 0
+        for pt in range(1, 7):
+            bb = board.pieces_mask(pt, color)
+            if not bb:
+                continue
+            tm, te = MG[color][pt], EG[color][pt]
+            for sq in chess.scan_forward(bb):
+                m += tm[sq]
+                e += te[sq]
+                if pt == PAWN:
+                    if not (PASSED_MASK[color][sq] & enemy_pawns):
+                        rk = chess.square_rank(sq) if color else 7 - chess.square_rank(sq)
+                        m += PASSED_BONUS_MG[rk]
+                        e += PASSED_BONUS_EG[rk]
+                elif pt == ROOK:
+                    fm = FILES[chess.square_file(sq)]
+                    if not (fm & own_pawns):
+                        m += 12
+                        e += 8
+                        if not (fm & enemy_pawns):
+                            m += 10
+                            e += 6
+                elif pt == KING:
+                    m += 9 * _popcount(SHIELD_MASK[color][sq] & own_pawns)
+            phase += PHASE_W[pt] * _popcount(bb)
+        if _popcount(board.pieces_mask(BISHOP, color)) >= 2:
+            m += 30
+            e += 45
+        # peones doblados
+        for f in range(8):
+            c = _popcount(own_pawns & FILES[f])
+            if c > 1:
+                m -= 12 * (c - 1)
+                e -= 18 * (c - 1)
+        mg += sign * m
+        eg += sign * e
+    if phase > 24:
+        phase = 24
+    score = (mg * phase + eg * (24 - phase)) // 24
+    score += 10 if board.turn else -10  # tempo
+    return score if board.turn else -score
+
+
+def _tt_key(board: chess.Board) -> int:
+    return hash(board._transposition_key())
+
+
+INF = 10 ** 6
+MATE = 100000
+MAX_PLY = 100
+EXACT, LOWER, UPPER = 0, 1, 2
+
+
+class _Timeout(Exception):
+    pass
+
+
+class PyEngine:
+    def __init__(self):
+        self.tt = {}
+        self.history = [0] * 4096
+        self.killers = [[None, None] for _ in range(MAX_PLY + 2)]
+        self.path = []
+        self.nodes = 0
+        self.hard_deadline = 0.0
+        self.root_move = None
+
+    def new_game(self):
+        self.tt.clear()
+        self.history = [0] * 4096
+
+    # ---------------------------------------------------------------
+    def _order(self, board, moves, tt_move, ply):
+        k0, k1 = self.killers[ply]
+        hist = self.history
+        scored = []
+        for m in moves:
+            if m == tt_move:
+                s = 10 ** 7
+            elif board.is_capture(m):
+                victim = board.piece_type_at(m.to_square) or PAWN
+                att = board.piece_type_at(m.from_square)
+                s = 10 ** 6 + VAL[victim] * 10 - VAL[att]
+            elif m.promotion:
+                s = 900000 + m.promotion
+            elif m == k0:
+                s = 800000
+            elif m == k1:
+                s = 700000
+            else:
+                s = min(hist[m.from_square * 64 + m.to_square], 600000)
+            scored.append((s, m))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, m in scored]
+
+    # ---------------------------------------------------------------
+    def _qsearch(self, board, alpha, beta, ply):
+        self.nodes += 1
+        if (self.nodes & 1023) == 0 and time.time() > self.hard_deadline:
+            raise _Timeout
+        if ply >= MAX_PLY:
+            return evaluate(board)
+
+        in_check = board.is_check()
+        if in_check:
+            best = -MATE + ply
+            moves = list(board.legal_moves)
+            if not moves:
+                return best
+            stand = -INF
+        else:
+            stand = evaluate(board)
+            if stand >= beta:
+                return stand
+            if stand > alpha:
+                alpha = stand
+            best = stand
+            moves = list(board.generate_legal_captures())
+
+        def mvv(m):
+            v = board.piece_type_at(m.to_square)
+            if v is None:
+                return 0 if not board.is_en_passant(m) else 10 * 100 - 100
+            return 10 * VAL[v] - VAL[board.piece_type_at(m.from_square)]
+
+        moves.sort(key=mvv, reverse=True)
+        opp = not board.turn
+        for m in moves:
+            if not in_check and not m.promotion:
+                victim = board.piece_type_at(m.to_square) or PAWN
+                if stand + VAL[victim] + 200 < alpha:
+                    continue  # delta pruning
+                att = board.piece_type_at(m.from_square)
+                if VAL[att] > VAL[victim] + 50 and board.is_attacked_by(opp, m.to_square):
+                    continue  # captura claramente perdedora
+            board.push(m)
+            score = -self._qsearch(board, -beta, -alpha, ply + 1)
+            board.pop()
+            if score > best:
+                best = score
+                if score > alpha:
+                    alpha = score
+                    if alpha >= beta:
+                        break
+        return best
+
+    # ---------------------------------------------------------------
+    def _search(self, board, depth, alpha, beta, ply, allow_null):
+        self.nodes += 1
+        if (self.nodes & 1023) == 0 and time.time() > self.hard_deadline:
+            raise _Timeout
+
+        is_pv = (beta - alpha) > 1
+        key = _tt_key(board)
+
+        if ply > 0:
+            hm = board.halfmove_clock
+            if hm >= 100:
+                return 0
+            if hm >= 4 and key in self.path[-hm:]:
+                return 0
+
+        in_check = board.is_check()
+        if in_check:
+            depth += 1
+        if depth <= 0:
+            return self._qsearch(board, alpha, beta, ply)
+        if ply >= MAX_PLY - 1:
+            return evaluate(board)
+
+        # --- TT ---
+        tt_move = None
+        entry = self.tt.get(key)
+        if entry is not None:
+            e_depth, flag, e_score, tt_move = entry
+            if ply > 0 and e_depth >= depth and not is_pv:
+                if e_score > MATE - 1000:
+                    e_score -= ply
+                elif e_score < -MATE + 1000:
+                    e_score += ply
+                if flag == EXACT:
+                    return e_score
+                if flag == LOWER and e_score >= beta:
+                    return e_score
+                if flag == UPPER and e_score <= alpha:
+                    return e_score
+
+        static = None
+        if not in_check and not is_pv and ply > 0:
+            static = evaluate(board)
+            # reverse futility
+            if depth <= 3 and static - 120 * depth >= beta:
+                return static
+            # null move
+            if (allow_null and depth >= 3 and static >= beta and
+                    board.occupied_co[board.turn] & ~(board.pawns | board.kings)):
+                R = 2 + (1 if depth >= 6 else 0)
+                self.path.append(key)
+                board.push(chess.Move.null())
+                score = -self._search(board, depth - 1 - R, -beta, -beta + 1, ply + 1, False)
+                board.pop()
+                self.path.pop()
+                if score >= beta:
+                    return beta if score >= MATE - 1000 else score
+
+        moves = list(board.legal_moves)
+        if not moves:
+            return (-MATE + ply) if in_check else 0
+        moves = self._order(board, moves, tt_move, ply)
+
+        orig_alpha = alpha
+        best = -INF
+        best_move = None
+        self.path.append(key)
+        for i, m in enumerate(moves):
+            is_quiet = not board.is_capture(m) and not m.promotion
+
+            # futility pruning
+            if (is_quiet and i > 0 and static is not None and depth <= 2 and
+                    static + 150 * depth <= alpha and best > -MATE + 1000):
+                continue
+
+            board.push(m)
+            gives_check = board.is_check()
+            if i == 0:
+                score = -self._search(board, depth - 1, -beta, -alpha, ply + 1, True)
+            else:
+                r = 0
+                if depth >= 3 and i >= 3 and is_quiet and not in_check and not gives_check:
+                    r = 1 + (1 if i >= 6 else 0) + (1 if (depth >= 6 and i >= 12) else 0)
+                    r = min(r, depth - 2)
+                score = -self._search(board, depth - 1 - r, -alpha - 1, -alpha, ply + 1, True)
+                if score > alpha and r > 0:
+                    score = -self._search(board, depth - 1, -alpha - 1, -alpha, ply + 1, True)
+                if alpha < score < beta:
+                    score = -self._search(board, depth - 1, -beta, -alpha, ply + 1, True)
+            board.pop()
+
+            if score > best:
+                best = score
+                best_move = m
+                if score > alpha:
+                    alpha = score
+                    if ply == 0:
+                        self.root_move = m
+                    if alpha >= beta:
+                        if is_quiet:
+                            ks = self.killers[ply]
+                            if ks[0] != m:
+                                ks[1] = ks[0]
+                                ks[0] = m
+                            self.history[m.from_square * 64 + m.to_square] += depth * depth
+                        break
+        self.path.pop()
+
+        if best <= orig_alpha:
+            flag = UPPER
+        elif best >= beta:
+            flag = LOWER
+        else:
+            flag = EXACT
+        stored = best
+        if stored > MATE - 1000:
+            stored += ply
+        elif stored < -MATE + 1000:
+            stored -= ply
+        if len(self.tt) > 800_000:
+            self.tt.clear()
+        self.tt[key] = (depth, flag, stored, best_move)
+        return best
+
+    # ---------------------------------------------------------------
+    def think(self, board: chess.Board, soft: float, hard: float, max_depth: int = 40):
+        """Devuelve (mejor_jugada, puntuación_cp, profundidad, nodos)."""
+        start = time.time()
+        self.hard_deadline = start + hard
+        self.nodes = 0
+        self.history = [h // 2 for h in self.history]
+        self.killers = [[None, None] for _ in range(MAX_PLY + 2)]
+
+        root = board.copy()
+        legal = list(root.legal_moves)
+        if len(legal) == 1:
+            return legal[0], 0, 0, 0
+
+        # historial de claves (para detectar repeticiones con la partida real)
+        tmp = board.copy()
+        keys = []
+        while tmp.move_stack:
+            tmp.pop()
+            keys.append(_tt_key(tmp))
+        keys.reverse()
+        self.path = keys
+
+        best_move, best_score, reached = legal[0], 0, 0
+        score = 0
+        for depth in range(1, max_depth + 1):
+            try:
+                self.root_move = None
+                if depth >= 5:
+                    delta = 35
+                    alpha, beta = score - delta, score + delta
+                    while True:
+                        self.path = keys[:]
+                        s = self._search(root, depth, alpha, beta, 0, False)
+                        if s <= alpha:
+                            alpha = -INF if alpha < -1000 else alpha - delta * 3
+                        elif s >= beta:
+                            beta = INF if beta > 1000 else beta + delta * 3
+                        else:
+                            break
+                        delta *= 2
+                    score = s
+                else:
+                    self.path = keys[:]
+                    score = self._search(root, depth, -INF, INF, 0, False)
+            except _Timeout:
+                break
+            if self.root_move is not None:
+                best_move, best_score, reached = self.root_move, score, depth
+            elapsed = time.time() - start
+            if abs(score) > MATE - 100:
+                break
+            if elapsed > soft * 0.5:
+                break
+        return best_move, best_score, reached, self.nodes
+
+
+# ======================================================================
+# SELECCIÓN DE MOVIMIENTO: libro -> Stockfish -> motor propio
+# ======================================================================
+def find_stockfish():
+    cands = [STOCKFISH_PATH,
+             shutil.which("stockfish") or "",
+             "/usr/games/stockfish", "/usr/bin/stockfish", "/usr/local/bin/stockfish",
+             os.path.join(BASE_DIR, "stockfish")]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
     return None
 
-def calculate_dynamic_depth(board: chess.Board, my_time_ms) -> int:
-    if isinstance(my_time_ms, datetime.timedelta):
-        time_left_sec = my_time_ms.total_seconds()
-    else:
-        time_left_sec = float(my_time_ms) / 1000.0 if my_time_ms else 180.0
 
-    if time_left_sec < 15:
-        return 2  # Apuros extremos
-    else:
-        return 3  # Profundidad óptima y rápida con caché
+class Brain:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.py = PyEngine()
+        self.sf = None
+        self.sf_path = find_stockfish()
+        self._start_stockfish()
 
-def get_best_move(board: chess.Board, my_time_ms: int = 180000) -> chess.Move:
-    if board.fullmove_number <= 15:
-        book_move = get_opening_move_polyglot(board)
-        if book_move:
-            print("  📖 Jugada de libro (book.bin)", flush=True)
-            return book_move
-
-    depth = calculate_dynamic_depth(board, my_time_ms)
-    print(f"  🧠 Calculando... Profundidad: {depth} | Reloj: {my_time_ms}", flush=True)
-
-    best_move = None
-    is_white = (board.turn == chess.WHITE)
-    best_value = -math.inf if is_white else math.inf
-    alpha = -math.inf
-    beta = math.inf
-
-    legal_moves = order_moves(board, list(board.legal_moves))
-
-    for move in legal_moves:
-        board.push(move)
-        board_val = minimax(board, depth - 1, alpha, beta, not is_white)
-        board.pop()
-
-        if is_white:
-            if board_val > best_value:
-                best_value = board_val
-                best_move = move
-            alpha = max(alpha, board_val)
-        else:
-            if board_val < best_value:
-                best_value = board_val
-                best_move = move
-            beta = min(beta, board_val)
-
-    return best_move if best_move else legal_moves[0]
-
-# ==========================================
-# 3. CONEXIÓN A LICHESS Y DESAFÍOS AUTÓNOMOS
-# ==========================================
-
-TOKEN = os.environ.get("LICHESS_TOKEN")
-if not TOKEN:
-    raise ValueError("⚠️ LICHESS_TOKEN no está configurado.")
-
-session = berserk.TokenSession(TOKEN)
-client = berserk.Client(session=session)
-
-try:
-    my_profile = client.account.get()
-    my_id = my_profile['id']
-    my_username = my_profile['username']
-except Exception as e:
-    raise RuntimeError(f"⚠️ Error al conectar con Lichess: {e}")
-
-is_in_game = False
-is_rated_turn = True
-
-def auto_challenge_loop():
-    global is_in_game, is_rated_turn
-    print("🤖 Gestor de Auto-Desafíos activado...", flush=True)
-    time.sleep(10)
-    
-    while True:
+    def _start_stockfish(self):
+        if not self.sf_path:
+            log("⚠️  Stockfish NO encontrado: usando motor propio de Python (mucho más débil).")
+            return
         try:
-            if not is_in_game:
-                online_bots = list(client.bots.get_online_bots())
-                available_bots = [b for b in online_bots if b.get('id') != my_id]
+            self.sf = chess.engine.SimpleEngine.popen_uci(self.sf_path)
+            opts = {"Threads": SF_THREADS, "Hash": SF_HASH, "Move Overhead": MOVE_OVERHEAD}
+            cfg = {k: v for k, v in opts.items() if k in self.sf.options}
+            self.sf.configure(cfg)
+            log(f"♟️  Stockfish listo: {self.sf.id.get('name', 'Stockfish')} ({self.sf_path}) {cfg}")
+        except Exception as e:
+            log(f"⚠️  No se pudo iniciar Stockfish ({e}). Usando motor propio.")
+            self.sf = None
 
-                if available_bots:
-                    target = random.choice(available_bots)
-                    target_id = target.get('id')
-                    mode_str = "Clasificada" if is_rated_turn else "Amistosa"
-                    
-                    print(f"⚔️ Retando a {target_id} ({mode_str})...", flush=True)
+    def new_game(self):
+        with self.lock:
+            self.py.new_game()
+            if self.sf:
+                try:
+                    self.sf.protocol.send_line("ucinewgame")
+                except Exception:
+                    pass
+
+    @staticmethod
+    def book_move(board):
+        if board.fullmove_number > BOOK_MAX_FULLMOVES or not os.path.exists(BOOK_PATH):
+            return None
+        try:
+            with chess.polyglot.open_reader(BOOK_PATH) as r:
+                return r.weighted_choice(board).move
+        except (IndexError, Exception):
+            return None
+
+    def choose(self, board, wtime, btime, winc, binc):
+        bm = self.book_move(board)
+        if bm and bm in board.legal_moves:
+            log("  📖 libro")
+            return bm
+
+        legal = list(board.legal_moves)
+        if len(legal) == 1:
+            return legal[0]
+
+        with self.lock:
+            if self.sf:
+                try:
+                    wt = (wtime if wtime is not None else 60000) / 1000.0
+                    bt = (btime if btime is not None else 60000) / 1000.0
+                    limit = chess.engine.Limit(
+                        white_clock=wt, black_clock=bt,
+                        white_inc=(winc or 0) / 1000.0, black_inc=(binc or 0) / 1000.0)
+                    res = self.sf.play(board, limit)
+                    if res.move:
+                        return res.move
+                except Exception as e:
+                    log(f"⚠️  Stockfish falló ({e}); reiniciando y usando respaldo.")
                     try:
-                        client.challenges.create(
-                            username=target_id,
-                            rated=is_rated_turn,
-                            clock_limit=180,
-                            clock_increment=2,
-                            color='random'
-                        )
-                        is_rated_turn = not is_rated_turn
+                        self.sf.quit()
                     except Exception:
                         pass
-                    
-                    time.sleep(40)
-                else:
-                    time.sleep(15)
-            else:
-                time.sleep(10)
-        except Exception:
-            time.sleep(20)
+                    self.sf = None
+                    self._start_stockfish()
 
-threading.Thread(target=auto_challenge_loop, daemon=True).start()
+            my_t = wtime if board.turn == chess.WHITE else btime
+            my_inc = winc if board.turn == chess.WHITE else binc
+            if my_t is None:
+                my_t = 300000.0
+            soft, hard = time_budget(my_t, my_inc or 0, board.ply())
+            mv, sc, d, n = self.py.think(board, soft, hard)
+            log(f"  🧠 propio: prof {d} | {sc:+d}cp | {n} nodos | soft {soft:.2f}s")
+            return mv
 
-# ==========================================
-# 4. BUCLE PRINCIPAL (Streaming y Partidas)
-# ==========================================
 
-print(f"✅ Bot listo y conectado como: {my_username}", flush=True)
+# ======================================================================
+# LICHESS
+# ======================================================================
+active_games = set()
+games_lock = threading.Lock()
 
-while True:
+
+def play_game(client, brain, my_id, game_id):
+    log(f"🎮 Partida: https://lichess.org/{game_id}")
+    brain.new_game()
+    my_color = None
+    initial = "startpos"
+    last_len = -1
     try:
-        for event in client.bots.stream_incoming_events():
-            event_type = event.get('type')
+        for ev in client.bots.stream_game_state(game_id):
+            t = ev.get("type")
+            if t == "gameFull":
+                my_color = chess.WHITE if ev["white"].get("id") == my_id else chess.BLACK
+                initial = ev.get("initialFen", "startpos")
+                state = ev["state"]
+            elif t == "gameState":
+                state = ev
+            else:
+                continue
 
-            if event_type == 'challenge':
-                challenge_id = event['challenge']['id']
-                challenger_id = event['challenge'].get('challenger', {}).get('id')
-                variant = event['challenge']['variant']['key']
+            if state.get("status") not in ("started", "created"):
+                log(f"🏁 Fin de {game_id}: {state.get('status')}")
+                break
 
-                if challenger_id == my_id: continue
+            board = chess.Board() if initial in (None, "startpos") else chess.Board(initial)
+            for u in (state.get("moves") or "").split():
+                board.push_uci(u)
 
-                if variant == 'standard':
+            if board.is_game_over() or board.turn != my_color:
+                continue
+            if len(board.move_stack) == last_len:
+                continue  # ya movimos en esta posición
+
+            wtime, btime = to_ms(state.get("wtime")), to_ms(state.get("btime"))
+            winc, binc = to_ms(state.get("winc")), to_ms(state.get("binc"))
+
+            t0 = time.time()
+            try:
+                move = brain.choose(board, wtime, btime, winc, binc)
+            except Exception as e:
+                log(f"⚠️  Error calculando ({e}); jugada de emergencia.")
+                move = random.choice(list(board.legal_moves))
+            try:
+                client.bots.make_move(game_id, move.uci())
+                last_len = len(board.move_stack)
+                log(f"  👉 {move.uci()} ({time.time() - t0:.2f}s)")
+            except Exception as e:
+                log(f"⚠️  Error enviando jugada: {e}")
+    except Exception as e:
+        log(f"⚠️  Stream de {game_id} cortado: {e}")
+    finally:
+        with games_lock:
+            active_games.discard(game_id)
+
+
+def start_game_thread(client, brain, my_id, game_id):
+    with games_lock:
+        if game_id in active_games:
+            return
+        active_games.add(game_id)
+    threading.Thread(target=play_game, args=(client, brain, my_id, game_id), daemon=True).start()
+
+
+def auto_challenge_loop(client, my_id, my_rating):
+    log("🤖 Auto-desafíos activados")
+    time.sleep(15)
+    cooldown = {}
+    while True:
+        try:
+            with games_lock:
+                busy = len(active_games) >= MAX_GAMES
+            if busy:
+                time.sleep(10)
+                continue
+            now = time.time()
+            bots = []
+            for i, b in enumerate(client.bots.get_online_bots()):
+                if i > 300:
+                    break
+                bid = b.get("id")
+                if not bid or bid == my_id or b.get("disabled"):
+                    continue
+                if cooldown.get(bid, 0) > now:
+                    continue
+                r = (b.get("perfs", {}).get("blitz", {}) or {}).get("rating", 1500)
+                bots.append((abs(r - my_rating), bid))
+            if not bots:
+                time.sleep(20)
+                continue
+            bots.sort()
+            pool = [b for _, b in bots[:25]]
+            target = random.choice(pool)
+            cooldown[target] = now + 600
+            log(f"⚔️  Retando a {target} ({'clasificada' if RATED else 'amistosa'})")
+            try:
+                client.challenges.create(username=target, rated=RATED,
+                                         clock_limit=TC_TIME, clock_increment=TC_INC, color="random")
+            except Exception as e:
+                log(f"   (reto fallido: {e})")
+            time.sleep(45)
+        except Exception as e:
+            log(f"auto_challenge error: {e}")
+            time.sleep(30)
+
+
+def keep_alive_loop():
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    while True:
+        time.sleep(600)
+        try:
+            urllib.request.urlopen(url, timeout=15).read()
+        except Exception:
+            pass
+
+
+def start_http_server():
+    from flask import Flask
+    app = Flask(__name__)
+
+    @app.route("/")
+    @app.route("/health")
+    def home():
+        return "MackBot ULTIMATE online", 200
+
+    port = int(os.environ.get("PORT", 10000))
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=port), daemon=True).start()
+
+
+def main():
+    import berserk
+    start_http_server()
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
+
+    token = os.environ.get("LICHESS_TOKEN")
+    if not token:
+        raise SystemExit("⚠️ Falta LICHESS_TOKEN")
+    client = berserk.Client(session=berserk.TokenSession(token))
+    profile = client.account.get()
+    my_id, my_name = profile["id"], profile["username"]
+    my_rating = (profile.get("perfs", {}).get("blitz", {}) or {}).get("rating", 1500)
+    log(f"✅ Conectado como {my_name} (blitz {my_rating})")
+
+    brain = Brain()
+
+    if AUTO_CHALLENGE:
+        threading.Thread(target=auto_challenge_loop, args=(client, my_id, my_rating), daemon=True).start()
+
+    # reanudar partidas en curso tras un reinicio
+    try:
+        for g in client.games.get_ongoing(limit=5):
+            start_game_thread(client, brain, my_id, g["gameId"])
+    except Exception:
+        pass
+
+    while True:
+        try:
+            for event in client.bots.stream_incoming_events():
+                et = event.get("type")
+                if et == "challenge":
+                    ch = event["challenge"]
+                    cid = ch["id"]
+                    challenger = (ch.get("challenger") or {}).get("id")
+                    if challenger == my_id:
+                        continue
+                    variant = ch.get("variant", {}).get("key")
+                    speed = ch.get("speed")
+                    with games_lock:
+                        busy = len(active_games) >= MAX_GAMES
                     try:
-                        client.bots.accept_challenge(challenge_id)
-                        print(f"🤝 Reto aceptado: {challenge_id}", flush=True)
-                    except Exception: pass
-                else:
-                    try: client.bots.decline_challenge(challenge_id, reason='variant')
-                    except Exception: pass
+                        if variant != "standard":
+                            client.bots.decline_challenge(cid, reason="standard")
+                        elif speed == "correspondence":
+                            client.bots.decline_challenge(cid, reason="timeControl")
+                        elif busy:
+                            client.bots.decline_challenge(cid, reason="later")
+                        else:
+                            client.bots.accept_challenge(cid)
+                            log(f"🤝 Reto aceptado de {challenger}")
+                    except Exception as e:
+                        log(f"(reto {cid}: {e})")
+                elif et == "gameStart":
+                    start_game_thread(client, brain, my_id, event["game"]["gameId"])
+        except Exception as err:
+            log(f"🔌 Stream de eventos caído, reconectando en 5s... ({err})")
+            time.sleep(5)
 
-            elif event_type == 'gameStart':
-                game_id = event['game']['gameId']
-                is_in_game = True
-                print(f"🎮 Partida iniciada: https://lichess.org/{game_id}", flush=True)
-                
-                # Limpiar caché al iniciar cada partida nueva
-                transposition_table.clear()
-                board = chess.Board()
 
-                try:
-                    game_active = True
-                    while game_active:
-                        try:
-                            for game_event in client.bots.stream_game_state(game_id):
-                                if game_event['type'] == 'gameFull':
-                                    white_id = game_event['white'].get('id')
-                                    is_white = (white_id == my_id)
-                                    state = game_event['state']
-                                elif game_event['type'] == 'gameState':
-                                    state = game_event
-                                else:
-                                    continue
-
-                                moves = state['moves'].split() if state['moves'] else []
-                                board.reset()
-                                for move in moves: board.push(chess.Move.from_uci(move))
-
-                                if state['status'] != 'started' or board.is_game_over():
-                                    print(f"🏁 Partida finalizada: {game_id}", flush=True)
-                                    game_active = False
-                                    break
-
-                                is_my_turn = (board.turn == chess.WHITE and is_white) or (board.turn == chess.BLACK and not is_white)
-
-                                if is_my_turn:
-                                    start_time = time.time()
-                                    
-                                    # Extracción de tiempo segura contra timedelta o int
-                                    raw_time = state.get('wtime', 180000) if is_white else state.get('btime', 180000)
-                                    if isinstance(raw_time, datetime.timedelta):
-                                        my_time_ms = raw_time.total_seconds() * 1000
-                                    else:
-                                        my_time_ms = int(raw_time) if raw_time else 180000
-                                    
-                                    best_move = get_best_move(board, my_time_ms=my_time_ms)
-                                    elapsed = time.time() - start_time
-                                    
-                                    try:
-                                        client.bots.make_move(game_id, best_move.uci())
-                                        print(f"  👉 Jugada enviada: {best_move.uci()} (Cálculo: {elapsed:.2f}s)", flush=True)
-                                    except Exception as e:
-                                        print(f"⚠️ Error enviando mov: {e}", flush=True)
-                        
-                        except Exception as stream_err:
-                            print(f"🔄 Reconectando stream de partida... ({stream_err})", flush=True)
-                            time.sleep(1)
-                            try:
-                                current_game = client.games.export(game_id)
-                                if current_game.get('status') != 'started':
-                                    game_active = False
-                            except Exception:
-                                game_active = False
-                finally:
-                    is_in_game = False
-
-    except Exception as err:
-        print(f"🔌 Desconexión general de Lichess. Reconectando en 5s... ({err})", flush=True)
-        time.sleep(5)
+if __name__ == "__main__":
+    main()
