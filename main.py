@@ -625,54 +625,94 @@ active_games = set()
 games_lock = threading.Lock()
 
 
+def send_move(client, game_id, move, attempts=6):
+    """Envía la jugada con reintentos ante fallos de red. Devuelve True si quedó enviada."""
+    for i in range(attempts):
+        try:
+            client.bots.make_move(game_id, move.uci())
+            return True
+        except Exception as e:
+            code = getattr(e, "status_code", None)
+            if code in (400, 404):
+                # Lichess la rechazó: normalmente ya se había registrado (o no es nuestro turno)
+                log(f"  ℹ️  Lichess respondió {code} al enviar {move.uci()} (probablemente ya aplicada)")
+                return True
+            log(f"⚠️  Error enviando jugada (intento {i + 1}/{attempts}): {e}")
+            time.sleep(min(0.25 * (i + 1), 1.5))
+    return False
+
+
 def play_game(client, brain, my_id, game_id):
     log(f"🎮 Partida: https://lichess.org/{game_id}")
     brain.new_game()
     my_color = None
     initial = "startpos"
     last_len = -1
+    finished = False
+    reconnects = 0
     try:
-        for ev in client.bots.stream_game_state(game_id):
-            t = ev.get("type")
-            if t == "gameFull":
-                my_color = chess.WHITE if ev["white"].get("id") == my_id else chess.BLACK
-                initial = ev.get("initialFen", "startpos")
-                state = ev["state"]
-            elif t == "gameState":
-                state = ev
-            else:
-                continue
-
-            if state.get("status") not in ("started", "created"):
-                log(f"🏁 Fin de {game_id}: {state.get('status')}")
-                break
-
-            board = chess.Board() if initial in (None, "startpos") else chess.Board(initial)
-            for u in (state.get("moves") or "").split():
-                board.push_uci(u)
-
-            if board.is_game_over() or board.turn != my_color:
-                continue
-            if len(board.move_stack) == last_len:
-                continue  # ya movimos en esta posición
-
-            wtime, btime = to_ms(state.get("wtime")), to_ms(state.get("btime"))
-            winc, binc = to_ms(state.get("winc")), to_ms(state.get("binc"))
-
-            t0 = time.time()
+        while not finished and reconnects < 30:
             try:
-                move = brain.choose(board, wtime, btime, winc, binc)
+                for ev in client.bots.stream_game_state(game_id):
+                    t = ev.get("type")
+                    if t == "gameFull":
+                        my_color = chess.WHITE if ev["white"].get("id") == my_id else chess.BLACK
+                        initial = ev.get("initialFen", "startpos")
+                        state = ev["state"]
+                    elif t == "gameState":
+                        state = ev
+                    else:
+                        continue
+
+                    if state.get("status") not in ("started", "created"):
+                        log(f"🏁 Fin de {game_id}: {state.get('status')}")
+                        finished = True
+                        break
+
+                    board = chess.Board() if initial in (None, "startpos") else chess.Board(initial)
+                    for u in (state.get("moves") or "").split():
+                        board.push_uci(u)
+
+                    if board.is_game_over() or board.turn != my_color:
+                        continue
+                    if len(board.move_stack) == last_len:
+                        continue  # ya movimos en esta posición
+
+                    wtime, btime = to_ms(state.get("wtime")), to_ms(state.get("btime"))
+                    winc, binc = to_ms(state.get("winc")), to_ms(state.get("binc"))
+
+                    t0 = time.time()
+                    try:
+                        move = brain.choose(board, wtime, btime, winc, binc)
+                    except Exception as e:
+                        log(f"⚠️  Error calculando ({e}); jugada de emergencia.")
+                        move = random.choice(list(board.legal_moves))
+
+                    if send_move(client, game_id, move):
+                        last_len = len(board.move_stack)
+                        log(f"  👉 {move.uci()} ({time.time() - t0:.2f}s)")
+                    else:
+                        # No se pudo enviar: forzamos reconectar el stream, que reenvía el estado
+                        # completo (gameFull) y nos da otra oportunidad de mover.
+                        raise ConnectionError("no se pudo enviar la jugada tras varios intentos")
+                else:
+                    # el stream terminó limpiamente: confirmamos si la partida sigue viva
+                    pass
             except Exception as e:
-                log(f"⚠️  Error calculando ({e}); jugada de emergencia.")
-                move = random.choice(list(board.legal_moves))
-            try:
-                client.bots.make_move(game_id, move.uci())
-                last_len = len(board.move_stack)
-                log(f"  👉 {move.uci()} ({time.time() - t0:.2f}s)")
-            except Exception as e:
-                log(f"⚠️  Error enviando jugada: {e}")
-    except Exception as e:
-        log(f"⚠️  Stream de {game_id} cortado: {e}")
+                reconnects += 1
+                log(f"🔄 Stream de {game_id} cortado ({e}); reconectando ({reconnects})...")
+                time.sleep(min(0.5 * reconnects, 3))
+                continue
+            if not finished:
+                # el stream se cerró sin fin de partida: ¿sigue en curso?
+                try:
+                    info = client.games.export(game_id)
+                    if info.get("status") not in ("started", "created"):
+                        finished = True
+                except Exception:
+                    pass
+                reconnects += 1
+                time.sleep(1)
     finally:
         with games_lock:
             active_games.discard(game_id)
