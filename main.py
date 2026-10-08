@@ -3,6 +3,7 @@ import time
 import math
 import random
 import threading
+import datetime
 from flask import Flask
 import chess
 import chess.polyglot
@@ -21,11 +22,10 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# Iniciamos el servidor en un hilo secundario
 threading.Thread(target=run_flask, daemon=True).start()
 
 # ==========================================
-# 2. MOTOR DE AJEDREZ Y EVALUACIÓN
+# 2. MOTOR DE AJEDREZ, CACHÉ Y EVALUACIÓN
 # ==========================================
 
 BOOK_PATH = os.path.join(os.path.dirname(__file__), "book.bin")
@@ -101,6 +101,9 @@ kingstable = [
      20, 30, 10,  0,  0, 10, 30, 20
 ]
 
+# Caché de Transposición para acelerar el Minimax sin perder profundidad
+transposition_table = {}
+
 def evaluate_board(board: chess.Board) -> int:
     if board.is_checkmate():
         return -99999 if board.turn == chess.WHITE else 99999
@@ -132,15 +135,13 @@ def order_moves(board: chess.Board, moves):
             attacker = board.piece_at(move.from_square)
             victim = board.piece_at(move.to_square)
             if attacker and victim:
-                # MVV-LVA (Ej: Peón captura Reina da muchos puntos)
                 score += 10 * PIECE_VALUES[victim.piece_type] - PIECE_VALUES[attacker.piece_type]
-                
-                # Penalización severa: No sacrificar piezas valiosas si la casilla está defendida
+                # Penalización severa para evitar colgar piezas en casillas defendidas
                 if PIECE_VALUES[attacker.piece_type] > PIECE_VALUES[victim.piece_type]:
                     if board.is_attacked_by(not board.turn, move.to_square):
                         score -= 2000
             else:
-                score += 500 # Captura al paso (En passant)
+                score += 500
         if board.gives_check(move):
             score += 300
         return score
@@ -173,8 +174,16 @@ def quiescence_search(board: chess.Board, alpha: int, beta: int) -> int:
     return alpha
 
 def minimax(board: chess.Board, depth: int, alpha: int, beta: int, is_maximizing: bool) -> int:
+    board_fen = board.fen()
+    cache_key = (board_fen, depth, is_maximizing)
+    
+    if cache_key in transposition_table:
+        return transposition_table[cache_key]
+
     if depth == 0 or board.is_game_over():
-        return quiescence_search(board, alpha, beta) if is_maximizing else -quiescence_search(board, -beta, -alpha)
+        val = quiescence_search(board, alpha, beta) if is_maximizing else -quiescence_search(board, -beta, -alpha)
+        transposition_table[cache_key] = val
+        return val
 
     legal_moves = order_moves(board, list(board.legal_moves))
 
@@ -187,6 +196,7 @@ def minimax(board: chess.Board, depth: int, alpha: int, beta: int, is_maximizing
             max_eval = max(max_eval, eval)
             alpha = max(alpha, eval)
             if beta <= alpha: break
+        transposition_table[cache_key] = max_eval
         return max_eval
     else:
         min_eval = math.inf
@@ -197,6 +207,7 @@ def minimax(board: chess.Board, depth: int, alpha: int, beta: int, is_maximizing
             min_eval = min(min_eval, eval)
             beta = min(beta, eval)
             if beta <= alpha: break
+        transposition_table[cache_key] = min_eval
         return min_eval
 
 def get_opening_move_polyglot(board: chess.Board) -> chess.Move | None:
@@ -210,16 +221,16 @@ def get_opening_move_polyglot(board: chess.Board) -> chess.Move | None:
         print(f"Error libro de aperturas: {e}", flush=True)
     return None
 
-def calculate_dynamic_depth(board: chess.Board, my_time_ms: int) -> int:
-    time_left_sec = my_time_ms / 1000.0
-    if time_left_sec < 15:
-        return 2  # Apuros extremos: respuesta casi instantánea
-    elif time_left_sec < 45:
-        return 3  # Apuros medios
+def calculate_dynamic_depth(board: chess.Board, my_time_ms) -> int:
+    if isinstance(my_time_ms, datetime.timedelta):
+        time_left_sec = my_time_ms.total_seconds()
     else:
-        num_pieces = len(board.piece_map())
-        # Si hay muchas piezas, max prof 3 para evitar colgar Render
-        return 4 if num_pieces <= 16 else 3
+        time_left_sec = float(my_time_ms) / 1000.0 if my_time_ms else 180.0
+
+    if time_left_sec < 15:
+        return 2  # Apuros extremos
+    else:
+        return 3  # Profundidad óptima y rápida con caché
 
 def get_best_move(board: chess.Board, my_time_ms: int = 180000) -> chess.Move:
     if board.fullmove_number <= 15:
@@ -229,7 +240,7 @@ def get_best_move(board: chess.Board, my_time_ms: int = 180000) -> chess.Move:
             return book_move
 
     depth = calculate_dynamic_depth(board, my_time_ms)
-    print(f"  🧠 Calculando... Profundidad: {depth} | Reloj: {my_time_ms/1000:.1f}s", flush=True)
+    print(f"  🧠 Calculando... Profundidad: {depth} | Reloj: {my_time_ms}", flush=True)
 
     best_move = None
     is_white = (board.turn == chess.WHITE)
@@ -263,7 +274,7 @@ def get_best_move(board: chess.Board, my_time_ms: int = 180000) -> chess.Move:
 
 TOKEN = os.environ.get("LICHESS_TOKEN")
 if not TOKEN:
-    raise ValueError("⚠️ LICHESS_TOKEN no está configurado en las variables de entorno.")
+    raise ValueError("⚠️ LICHESS_TOKEN no está configurado.")
 
 session = berserk.TokenSession(TOKEN)
 client = berserk.Client(session=session)
@@ -273,7 +284,7 @@ try:
     my_id = my_profile['id']
     my_username = my_profile['username']
 except Exception as e:
-    raise RuntimeError(f"⚠️ Error al conectar con Lichess. Revisa el TOKEN. Detalles: {e}")
+    raise RuntimeError(f"⚠️ Error al conectar con Lichess: {e}")
 
 is_in_game = False
 is_rated_turn = True
@@ -304,15 +315,14 @@ def auto_challenge_loop():
                             color='random'
                         )
                         is_rated_turn = not is_rated_turn
-                    except berserk.exceptions.ResponseError as err:
-                        # Ignorar silenciosamente errores de límite de retos diarios
+                    except Exception:
                         pass
                     
-                    time.sleep(40) # Espera a ver si aceptan antes de mandar otro
+                    time.sleep(40)
                 else:
                     time.sleep(15)
             else:
-                time.sleep(10) # En partida, revisar menos seguido
+                time.sleep(10)
         except Exception:
             time.sleep(20)
 
@@ -350,6 +360,8 @@ while True:
                 is_in_game = True
                 print(f"🎮 Partida iniciada: https://lichess.org/{game_id}", flush=True)
                 
+                # Limpiar caché al iniciar cada partida nueva
+                transposition_table.clear()
                 board = chess.Board()
 
                 try:
@@ -379,23 +391,27 @@ while True:
 
                                 if is_my_turn:
                                     start_time = time.time()
-                                    my_time_ms = state.get('wtime', 180000) if is_white else state.get('btime', 180000)
+                                    
+                                    # Extracción de tiempo segura contra timedelta o int
+                                    raw_time = state.get('wtime', 180000) if is_white else state.get('btime', 180000)
+                                    if isinstance(raw_time, datetime.timedelta):
+                                        my_time_ms = raw_time.total_seconds() * 1000
+                                    else:
+                                        my_time_ms = int(raw_time) if raw_time else 180000
                                     
                                     best_move = get_best_move(board, my_time_ms=my_time_ms)
                                     elapsed = time.time() - start_time
                                     
                                     try:
                                         client.bots.make_move(game_id, best_move.uci())
-                                        print(f"  👉 Jugada enviada: {best_move.uci()} (Tiempo cálculo: {elapsed:.2f}s)", flush=True)
+                                        print(f"  👉 Jugada enviada: {best_move.uci()} (Cálculo: {elapsed:.2f}s)", flush=True)
                                     except Exception as e:
                                         print(f"⚠️ Error enviando mov: {e}", flush=True)
                         
                         except Exception as stream_err:
-                            # Reconexión interna blindada para la partida activa
                             print(f"🔄 Reconectando stream de partida... ({stream_err})", flush=True)
                             time.sleep(1)
                             try:
-                                # Verificar si el juego sigue existiendo en el servidor
                                 current_game = client.games.export(game_id)
                                 if current_game.get('status') != 'started':
                                     game_active = False
