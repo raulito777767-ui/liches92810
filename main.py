@@ -224,14 +224,12 @@ def get_opening_move_polyglot(board: chess.Board) -> chess.Move | None:
     return None
 
 def get_best_move(board: chess.Board, depth: int = 4) -> chess.Move:
-    # 1. Consultar el libro de aperturas .bin
     if board.fullmove_number <= 15:
         book_move = get_opening_move_polyglot(board)
         if book_move:
             print("  📖 Jugada ejecutada desde book.bin")
             return book_move
 
-    # 2. Búsqueda Minimax
     best_move = None
     is_white = (board.turn == chess.WHITE)
     best_value = -math.inf if is_white else math.inf
@@ -297,22 +295,26 @@ def auto_challenge_loop():
                     
                     print(f"Enviando desafío {mode_str} al bot: {target_id}")
                     
-                    client.challenges.create(
-                        username=target_id,
-                        rated=rated_mode,
-                        clock_limit=180,
-                        clock_increment=2,
-                        color='random',
-                        variant='standard'
-                    )
-                    
-                    is_rated_turn = not is_rated_turn
+                    try:
+                        client.challenges.create(
+                            username=target_id,
+                            rated=rated_mode,
+                            clock_limit=180,
+                            clock_increment=2,
+                            color='random',
+                            variant='standard'
+                        )
+                        is_rated_turn = not is_rated_turn
+                    except Exception as err:
+                        print(f"Error al enviar reto a {target_id}: {err}")
+
                     time.sleep(40)
                 else:
                     time.sleep(15)
             else:
                 time.sleep(10)
-        except Exception:
+        except Exception as e:
+            print(f"Error en bucle de auto-desafío: {e}")
             time.sleep(20)
 
 threading.Thread(target=auto_challenge_loop, daemon=True).start()
@@ -330,12 +332,23 @@ for event in client.bots.stream_incoming_events():
         challenge = event['challenge']
         challenge_id = challenge['id']
         variant = challenge['variant']['key']
+        challenger_id = challenge.get('challenger', {}).get('id')
+
+        # Ignorar retos creados por nosotros mismos
+        if challenger_id == my_id:
+            continue
 
         if variant == 'standard':
-            client.bots.accept_challenge(challenge_id)
-            print(f"Reto entrante aceptado: {challenge_id}")
+            try:
+                client.bots.accept_challenge(challenge_id)
+                print(f"Reto entrante aceptado: {challenge_id}")
+            except berserk.exceptions.ResponseError as e:
+                print(f"No se pudo aceptar el reto {challenge_id}: {e}")
         else:
-            client.bots.decline_challenge(challenge_id, reason='variant')
+            try:
+                client.bots.decline_challenge(challenge_id, reason='variant')
+            except berserk.exceptions.ResponseError:
+                pass
 
     elif event_type == 'gameStart':
         game_id = event['game']['gameId']
@@ -373,7 +386,10 @@ for event in client.bots.stream_incoming_events():
                     best_move = get_best_move(board, depth=depth)
                     elapsed = time.time() - start_time
                     
-                    client.bots.make_move(game_id, best_move.uci())
-                    print(f"Jugada enviada [{game_id}]: {best_move.uci()} (en {elapsed:.2f}s)")
+                    try:
+                        client.bots.make_move(game_id, best_move.uci())
+                        print(f"Jugada enviada [{game_id}]: {best_move.uci()} (en {elapsed:.2f}s)")
+                    except berserk.exceptions.ResponseError as e:
+                        print(f"Error enviando movimiento (partida probablemente terminada): {e}")
         finally:
             is_in_game = False
