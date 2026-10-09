@@ -34,6 +34,9 @@ AUTO_CHALLENGE = os.environ.get("AUTO_CHALLENGE", "1") == "1"
 RATED = os.environ.get("RATED", "1") == "1"
 TC_TIME = int(os.environ.get("TC_TIME", "180"))
 TC_INC = int(os.environ.get("TC_INC", "2"))
+CHALLENGE_INTERVAL = int(os.environ.get("CHALLENGE_INTERVAL", "90"))        # s entre retos
+MAX_CHALLENGES_PER_HOUR = int(os.environ.get("MAX_CHALLENGES_PER_HOUR", "20"))
+BOT_LIST_TTL = int(os.environ.get("BOT_LIST_TTL", "300"))                    # s de caché de la lista de bots
 BOOK_MAX_FULLMOVES = 12
 
 
@@ -726,10 +729,17 @@ def start_game_thread(client, brain, my_id, game_id):
     threading.Thread(target=play_game, args=(client, brain, my_id, game_id), daemon=True).start()
 
 
+def _is_429(e):
+    return getattr(e, "status_code", None) == 429 or "429" in str(e)
+
+
 def auto_challenge_loop(client, my_id, my_rating):
     log("🤖 Auto-desafíos activados")
-    time.sleep(15)
+    time.sleep(20)
     cooldown = {}
+    sent = []              # marcas de tiempo de retos enviados (última hora)
+    bots_cache, cache_ts = [], 0.0
+    backoff = 0
     while True:
         try:
             with games_lock:
@@ -737,35 +747,48 @@ def auto_challenge_loop(client, my_id, my_rating):
             if busy:
                 time.sleep(15)
                 continue
+
             now = time.time()
-            bots = []
-            for i, b in enumerate(client.bots.get_online_bots()):
-                if i > 300:
-                    break
-                bid = b.get("id")
-                if not bid or bid == my_id or b.get("disabled"):
-                    continue
-                if cooldown.get(bid, 0) > now:
-                    continue
-                r = (b.get("perfs", {}).get("blitz", {}) or {}).get("rating", 1500)
-                bots.append((abs(r - my_rating), bid))
-            if not bots:
+            sent[:] = [t for t in sent if now - t < 3600]
+            if len(sent) >= MAX_CHALLENGES_PER_HOUR:
+                time.sleep(60)
+                continue
+
+            # lista de bots: se refresca como mucho cada BOT_LIST_TTL segundos
+            if not bots_cache or now - cache_ts > BOT_LIST_TTL:
+                fresh = []
+                for i, b in enumerate(client.bots.get_online_bots()):
+                    if i > 300:
+                        break
+                    bid = b.get("id")
+                    if not bid or bid == my_id or b.get("disabled"):
+                        continue
+                    r = (b.get("perfs", {}).get("blitz", {}) or {}).get("rating", 1500)
+                    fresh.append((abs(r - my_rating), bid))
+                fresh.sort()
+                bots_cache, cache_ts = fresh, time.time()
+
+            pool = [bid for _, bid in bots_cache[:40] if cooldown.get(bid, 0) < now]
+            if not pool:
                 time.sleep(30)
                 continue
-            bots.sort()
-            pool = [b for _, b in bots[:25]]
+
             target = random.choice(pool)
-            cooldown[target] = now + 600
+            cooldown[target] = now + 900
             log(f"⚔️  Retando a {target} ({'clasificada' if RATED else 'amistosa'})")
-            try:
-                client.challenges.create(username=target, rated=RATED,
-                                         clock_limit=TC_TIME, clock_increment=TC_INC, color="random")
-            except Exception as e:
-                log(f"   (reto fallido: {e})")
-            time.sleep(60)
+            client.challenges.create(username=target, rated=RATED,
+                                     clock_limit=TC_TIME, clock_increment=TC_INC, color="random")
+            sent.append(time.time())
+            backoff = 0
+            time.sleep(CHALLENGE_INTERVAL + random.uniform(0, 20))
         except Exception as e:
-            log(f"auto_challenge error: {e}")
-            time.sleep(60)
+            if _is_429(e):
+                backoff = min(backoff * 2 if backoff else 120, 900)
+                log(f"⏳ Lichess pide frenar (429). Pausa de {backoff}s en los auto-desafíos.")
+                time.sleep(backoff)
+            else:
+                log(f"   (reto fallido: {e})")
+                time.sleep(CHALLENGE_INTERVAL)
 
 
 def keep_alive_loop():
