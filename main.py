@@ -735,7 +735,7 @@ def auto_challenge_loop(client, my_id, my_rating):
             with games_lock:
                 busy = len(active_games) >= MAX_GAMES
             if busy:
-                time.sleep(10)
+                time.sleep(15)
                 continue
             now = time.time()
             bots = []
@@ -750,7 +750,7 @@ def auto_challenge_loop(client, my_id, my_rating):
                 r = (b.get("perfs", {}).get("blitz", {}) or {}).get("rating", 1500)
                 bots.append((abs(r - my_rating), bid))
             if not bots:
-                time.sleep(20)
+                time.sleep(30)
                 continue
             bots.sort()
             pool = [b for _, b in bots[:25]]
@@ -762,10 +762,10 @@ def auto_challenge_loop(client, my_id, my_rating):
                                          clock_limit=TC_TIME, clock_increment=TC_INC, color="random")
             except Exception as e:
                 log(f"   (reto fallido: {e})")
-            time.sleep(45)
+            time.sleep(60)
         except Exception as e:
             log(f"auto_challenge error: {e}")
-            time.sleep(30)
+            time.sleep(60)
 
 
 def keep_alive_loop():
