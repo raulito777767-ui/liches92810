@@ -31,8 +31,18 @@ MOVE_OVERHEAD = int(os.environ.get("MOVE_OVERHEAD", "500"))   # ms de latencia d
 MAX_GAMES = int(os.environ.get("MAX_GAMES", "1"))
 AUTO_CHALLENGE = os.environ.get("AUTO_CHALLENGE", "1") == "1"
 RATED = os.environ.get("RATED", "1") == "1"
-TC_TIME = int(os.environ.get("TC_TIME", "180"))
-TC_INC = int(os.environ.get("TC_INC", "2"))
+# Modos de los auto-desafíos: lista separada por comas de bullet, blitz, rapid, classical.
+# Ej.: CHALLENGE_MODES=bullet,blitz,rapid,classical   (por defecto solo blitz)
+CHALLENGE_MODES = os.environ.get("CHALLENGE_MODES", "blitz")
+# Opcional: ritmos exactos "segundos+incremento", p. ej. CHALLENGE_TCS=60+0,180+2,600+5,1800+0
+# Si se define, tiene prioridad sobre CHALLENGE_MODES.
+CHALLENGE_TCS = os.environ.get("CHALLENGE_TCS", "").strip()
+TC_PRESETS = {
+    "bullet": [(60, 0), (60, 1), (120, 1)],
+    "blitz": [(180, 0), (180, 2), (300, 0), (300, 3)],
+    "rapid": [(600, 0), (600, 5), (900, 10)],
+    "classical": [(1800, 0), (1800, 20)],
+}
 CHALLENGE_INTERVAL = int(os.environ.get("CHALLENGE_INTERVAL", "90"))        # s entre retos
 MAX_CHALLENGES_PER_HOUR = int(os.environ.get("MAX_CHALLENGES_PER_HOUR", "20"))
 BOT_LIST_TTL = int(os.environ.get("BOT_LIST_TTL", "300"))                    # s de caché de la lista de bots
@@ -159,6 +169,44 @@ class Brain:
         return random.choice(legal)
 
 
+def speed_of(limit, inc):
+    """Clasificación de Lichess según la duración estimada (límite + 40 * incremento)."""
+    est = limit + 40 * inc
+    if est < 30:
+        return "ultraBullet"
+    if est < 180:
+        return "bullet"
+    if est < 480:
+        return "blitz"
+    if est < 1500:
+        return "rapid"
+    return "classical"
+
+
+def build_time_controls():
+    tcs = []
+    if CHALLENGE_TCS:
+        for item in CHALLENGE_TCS.split(","):
+            try:
+                a, b = item.strip().split("+")
+                tcs.append((int(a), int(b)))
+            except ValueError:
+                log(f"⚠️  Ritmo inválido en CHALLENGE_TCS: '{item}' (usa segundos+incremento)")
+    else:
+        for m in CHALLENGE_MODES.split(","):
+            m = m.strip().lower()
+            if m in TC_PRESETS:
+                tcs += TC_PRESETS[m]
+            elif m:
+                log(f"⚠️  Modo desconocido en CHALLENGE_MODES: '{m}'")
+    return tcs or list(TC_PRESETS["blitz"])
+
+
+def rating_of(perfs, speed):
+    return ((perfs or {}).get(speed) or {}).get("rating", 1500)
+
+
+
 # ======================================================================
 # LICHESS
 # ======================================================================
@@ -267,12 +315,17 @@ def _is_429(e):
     return getattr(e, "status_code", None) == 429 or "429" in str(e)
 
 
-def auto_challenge_loop(client, my_id, my_rating):
-    log("🤖 Auto-desafíos activados")
+def auto_challenge_loop(client, my_id, my_perfs):
+    tcs = build_time_controls()
+    by_speed = {}
+    for tc in tcs:
+        by_speed.setdefault(speed_of(*tc), []).append(tc)
+    log(f"🤖 Auto-desafíos activados: " +
+        ", ".join(f"{sp} {['%d+%d' % t for t in v]}" for sp, v in by_speed.items()))
     time.sleep(20)
     cooldown = {}
     sent = []              # marcas de tiempo de retos enviados (última hora)
-    bots_cache, cache_ts = [], 0.0
+    bots_raw, cache_ts = [], 0.0
     backoff = 0
     while True:
         try:
@@ -289,7 +342,7 @@ def auto_challenge_loop(client, my_id, my_rating):
                 continue
 
             # lista de bots: se refresca como mucho cada BOT_LIST_TTL segundos
-            if not bots_cache or now - cache_ts > BOT_LIST_TTL:
+            if not bots_raw or now - cache_ts > BOT_LIST_TTL:
                 fresh = []
                 for i, b in enumerate(client.bots.get_online_bots()):
                     if i > 300:
@@ -297,21 +350,24 @@ def auto_challenge_loop(client, my_id, my_rating):
                     bid = b.get("id")
                     if not bid or bid == my_id or b.get("disabled"):
                         continue
-                    r = (b.get("perfs", {}).get("blitz", {}) or {}).get("rating", 1500)
-                    fresh.append((abs(r - my_rating), bid))
-                fresh.sort()
-                bots_cache, cache_ts = fresh, time.time()
+                    fresh.append((bid, b.get("perfs", {}) or {}))
+                bots_raw, cache_ts = fresh, time.time()
 
-            pool = [bid for _, bid in bots_cache[:40] if cooldown.get(bid, 0) < now]
+            # primero el modo (uniforme entre los activados), luego el ritmo concreto
+            speed = random.choice(list(by_speed))
+            limit, inc = random.choice(by_speed[speed])
+            my_r = rating_of(my_perfs, speed)
+            ranked = sorted((abs(rating_of(perfs, speed) - my_r), bid) for bid, perfs in bots_raw)
+            pool = [bid for _, bid in ranked[:40] if cooldown.get(bid, 0) < now]
             if not pool:
                 time.sleep(30)
                 continue
 
             target = random.choice(pool)
             cooldown[target] = now + 900
-            log(f"⚔️  Retando a {target} ({'clasificada' if RATED else 'amistosa'})")
+            log(f"⚔️  Retando a {target} ({speed} {limit}+{inc}, {'clasificada' if RATED else 'amistosa'})")
             client.challenges.create(username=target, rated=RATED,
-                                     clock_limit=TC_TIME, clock_increment=TC_INC, color="random")
+                                     clock_limit=limit, clock_increment=inc, color="random")
             sent.append(time.time())
             backoff = 0
             time.sleep(CHALLENGE_INTERVAL + random.uniform(0, 20))
@@ -349,13 +405,13 @@ def main():
     client = berserk.Client(session=berserk.TokenSession(token))
     profile = client.account.get()
     my_id, my_name = profile["id"], profile["username"]
-    my_rating = (profile.get("perfs", {}).get("blitz", {}) or {}).get("rating", 1500)
-    log(f"✅ Conectado como {my_name} (blitz {my_rating})")
+    my_perfs = profile.get("perfs", {}) or {}
+    log(f"✅ Conectado como {my_name} (blitz {rating_of(my_perfs, 'blitz')})")
 
     brain = Brain()
 
     if AUTO_CHALLENGE:
-        threading.Thread(target=auto_challenge_loop, args=(client, my_id, my_rating), daemon=True).start()
+        threading.Thread(target=auto_challenge_loop, args=(client, my_id, my_perfs), daemon=True).start()
 
     # reanudar partidas en curso tras un reinicio
     try:
