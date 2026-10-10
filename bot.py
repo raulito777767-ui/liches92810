@@ -46,6 +46,7 @@ TC_PRESETS = {
 CHALLENGE_INTERVAL = int(os.environ.get("CHALLENGE_INTERVAL", "90"))        # s entre retos
 MAX_CHALLENGES_PER_HOUR = int(os.environ.get("MAX_CHALLENGES_PER_HOUR", "20"))
 BOT_LIST_TTL = int(os.environ.get("BOT_LIST_TTL", "300"))                    # s de caché de la lista de bots
+LOG_ENGINE = os.environ.get("LOG_ENGINE", "1") == "1"        # mostrar prof/eval/nodos en los logs
 BOOK_MAX_FULLMOVES = 12
 
 
@@ -137,6 +138,28 @@ class Brain:
         except (IndexError, Exception):
             return None
 
+    @staticmethod
+    def _log_info(info):
+        """Escribe profundidad, evaluación (desde el punto de vista del bot) y nodos."""
+        if not LOG_ENGINE or not info:
+            return
+        try:
+            parts = []
+            if "depth" in info:
+                parts.append(f"prof {info['depth']}")
+            sc = info.get("score")
+            if sc is not None:
+                rel = sc.relative
+                parts.append(f"#{rel.mate()}" if rel.is_mate() else f"{rel.score() / 100:+.2f}")
+            if "nodes" in info:
+                parts.append(f"{info['nodes']:,} nodos")
+            if "nps" in info:
+                parts.append(f"{info['nps']:,} n/s")
+            if parts:
+                log("  🧠 " + " | ".join(parts))
+        except Exception:
+            pass
+
     def choose(self, board, wtime, btime, winc, binc, game_id=None):
         bm = self.book_move(board)
         if bm and bm in board.legal_moves:
@@ -145,6 +168,7 @@ class Brain:
 
         legal = list(board.legal_moves)
         if len(legal) == 1:
+            log("  ♟️  jugada única")
             return legal[0]
 
         wt = (wtime if wtime is not None else 60000) / 1000.0
@@ -159,8 +183,9 @@ class Brain:
                     if self.engine is None:
                         self._start_engine()
                     if self.engine is not None:
-                        res = self.engine.play(board, limit, game=game_id)
+                        res = self.engine.play(board, limit, game=game_id, info=chess.engine.INFO_ALL)
                         if res.move and res.move in board.legal_moves:
+                            self._log_info(res.info)
                             return res.move
                 except Exception as e:
                     log(f"⚠️  El motor falló ({e}); reiniciándolo.")
