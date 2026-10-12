@@ -1,17 +1,22 @@
 /*
  * MackEngine - motor de ajedrez UCI en C para MackBot
  * ----------------------------------------------------
- * - Bitboards + magic bitboards (se generan al arrancar, ~10 ms)
+ * - Bitboards + magic bitboards (se generan al arrancar, ~0.3 s)
  * - Negamax / PVS, profundizacion iterativa, ventanas de aspiracion
- * - Tabla de transposicion (tamano configurable, Hash MB)
+ * - Tabla de transposicion (Hash MB) usada tambien en la quiescence
  * - Null-move, reverse futility, futility, LMP, LMR, IIR, extension por jaque
- * - Killers + history (con malus) + MVV-LVA
- * - Quiescence con delta pruning
+ * - SEE (intercambios estaticos) para ordenar capturas y podar jugadas perdedoras
+ * - Killers + countermove + history (con malus; tambien modula el LMR) + MVV-LVA
+ * - Quiescence con delta pruning y poda por SEE
  * - Evaluacion tapered (PST + peones pasados/aislados/doblados + movilidad +
  *   pareja de alfiles + torres en columnas abiertas + escudo del rey + mop-up)
  * - Gestion de tiempo propia (wtime/btime/winc/binc/movestogo/movetime)
  *
+ * Interruptores de compilacion para experimentos (-DNO_SEE, -DNO_QTT, -DNO_CM,
+ * -DNO_SEEPRUNE, -DNO_HLMR). Por defecto todo esta activado.
+ *
  * Compilar:  gcc -O3 -o mackengine engine.c -lm
+ * Medir:     ./mackengine bench 12   (nodos deterministas + velocidad)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -659,6 +664,9 @@ static void tt_alloc(int mb) {
 }
 
 static Move killers[MAXPLY + 4][2];
+static Move counter_mv[64][64];
+static Move pm[MAXPLY + 4];       /* jugada que llevo a este nodo */
+static int silent = 0, poll_stdin = 1;
 static int history[2][64][64];
 static int sev[MAXPLY + 4];
 static int lmr_tab[64][64];
@@ -678,6 +686,7 @@ static double now_s(void) {
 }
 
 static void check_stop(void) {
+    if (!poll_stdin) { if (!infinite_mode && now_s() >= hard_deadline) stop_flag = 1; if (node_limit && nodes >= node_limit) stop_flag = 1; return; }
     if (!infinite_mode && now_s() >= hard_deadline) stop_flag = 1;
     if (node_limit && nodes >= node_limit) stop_flag = 1;
 #ifndef _WIN32
@@ -713,6 +722,56 @@ static int insufficient(const Pos *p) {
     return popcnt(minors) <= 1;
 }
 
+static inline U64 attackers_to(const Pos *p, int sq, U64 occ) {
+    U64 bq = p->bb[2] | p->bb[8] | p->bb[4] | p->bb[10];
+    U64 rq = p->bb[3] | p->bb[9] | p->bb[4] | p->bb[10];
+    return (pawn_att[BLACK][sq] & p->bb[PC(WHITE, PAWN)]) | (pawn_att[WHITE][sq] & p->bb[PC(BLACK, PAWN)]) |
+           (knight_att[sq] & (p->bb[1] | p->bb[7])) | (king_att[sq] & (p->bb[5] | p->bb[11])) |
+           (bishop_att(sq, occ) & bq) | (rook_att(sq, occ) & rq);
+}
+
+/* SEE: devuelve 1 si el intercambio en la casilla destino rinde >= threshold */
+static int see_ge(const Pos *p, Move m, int threshold) {
+    if (MFLAG(m) & (F_EP | F_CASTLE)) return 0 >= threshold;
+    if (MPROMO(m)) return 1;
+    int from = MFROM(m), to = MTO(m);
+    int swap = (p->mb[to] == EMPTY ? 0 : VAL[TYPE(p->mb[to])]) - threshold;
+    if (swap < 0) return 0;
+    swap = VAL[TYPE(p->mb[from])] - swap;
+    if (swap <= 0) return 1;
+    U64 bq = p->bb[2] | p->bb[8] | p->bb[4] | p->bb[10];
+    U64 rq = p->bb[3] | p->bb[9] | p->bb[4] | p->bb[10];
+    U64 occ = p->all ^ BIT(from) ^ BIT(to), bb;
+    int stm = p->side, res = 1;
+    U64 attackers = attackers_to(p, to, occ);
+    for (;;) {
+        stm ^= 1;
+        attackers &= occ;
+        U64 sa = attackers & p->occ[stm];
+        if (!sa) break;
+        res ^= 1;
+        if ((bb = sa & p->bb[PC(stm, PAWN)])) {
+            if ((swap = VAL[PAWN] - swap) < res) break;
+            occ ^= BIT(lsb(bb)); attackers |= bishop_att(to, occ) & bq;
+        } else if ((bb = sa & p->bb[PC(stm, KNIGHT)])) {
+            if ((swap = VAL[KNIGHT] - swap) < res) break;
+            occ ^= BIT(lsb(bb));
+        } else if ((bb = sa & p->bb[PC(stm, BISHOP)])) {
+            if ((swap = VAL[BISHOP] - swap) < res) break;
+            occ ^= BIT(lsb(bb)); attackers |= bishop_att(to, occ) & bq;
+        } else if ((bb = sa & p->bb[PC(stm, ROOK)])) {
+            if ((swap = VAL[ROOK] - swap) < res) break;
+            occ ^= BIT(lsb(bb)); attackers |= rook_att(to, occ) & rq;
+        } else if ((bb = sa & p->bb[PC(stm, QUEEN)])) {
+            if ((swap = VAL[QUEEN] - swap) < res) break;
+            occ ^= BIT(lsb(bb)); attackers |= (bishop_att(to, occ) & bq) | (rook_att(to, occ) & rq);
+        } else {
+            return (attackers & ~p->occ[stm]) ? res ^ 1 : res;
+        }
+    }
+    return res;
+}
+
 static void score_moves(const Pos *p, MList *L, Move ttm, int ply) {
     int them = p->side ^ 1;
     for (int i = 0; i < L->n; i++) {
@@ -726,11 +785,19 @@ static void score_moves(const Pos *p, MList *L, Move ttm, int ply) {
             if (victim >= 0) {
                 int att = TYPE(p->mb[MFROM(m)]);
                 sc = VORD[victim] * 16 - VORD[att];
+#ifndef NO_SEE
+                if (!see_ge(p, m, 0)) sc -= 200000; else sc += 1000000;
+                (void)them;
+#else
                 if (VAL[att] > VAL[victim] + 50 && attacked(p, to, them)) sc -= 200000;
                 else sc += 1000000;
+#endif
             } else if (MPROMO(m)) sc = 900000 + MPROMO(m);
             else if (m == killers[ply][0]) sc = 800000;
             else if (m == killers[ply][1]) sc = 700000;
+#ifndef NO_CM
+            else if (pm[ply] && m == counter_mv[MFROM(pm[ply])][MTO(pm[ply])]) sc = 650000;
+#endif
             else sc = history[p->side][MFROM(m)][MTO(m)];
         }
         L->sc[i] = sc;
@@ -757,6 +824,21 @@ static int qsearch(Pos *p, int alpha, int beta, int ply) {
     if (stop_flag) return 0;
     if (ply >= MAXPLY - 1) return evaluate(p);
 
+    int pv = (beta - alpha) > 1, orig_alpha = alpha;
+    Move ttm = 0;
+#ifndef NO_QTT
+    TTEntry *e = &tt[p->key & tt_mask];
+    if (e->key == p->key) {
+        ttm = e->move;
+        if (!pv) {
+            int tts = e->score, flag = e->fa & 3;
+            if (tts > MATE_BOUND) tts -= ply; else if (tts < -MATE_BOUND) tts += ply;
+            if (flag == EXACT) return tts;
+            if (flag == LOWER && tts >= beta) return tts;
+            if (flag == UPPER && tts <= alpha) return tts;
+        }
+    }
+#endif
     int chk = in_check(p), best, stand = -INF;
     MList L;
     if (chk) {
@@ -769,28 +851,52 @@ static int qsearch(Pos *p, int alpha, int beta, int ply) {
         best = stand;
         gen(p, &L, 1);
     }
-    score_moves(p, &L, 0, ply);
+    score_moves(p, &L, ttm, ply);
+    Move best_move = 0;
+#ifdef NO_SEE
     int them = p->side ^ 1;
+#endif
     for (int i = 0; i < L.n; i++) {
         Move m = pick(&L, i);
         if (!chk && !MPROMO(m)) {
             int victim = (MFLAG(m) & F_EP) ? PAWN : TYPE(p->mb[MTO(m)]);
-            int att = TYPE(p->mb[MFROM(m)]);
             if (stand + VAL[victim] + 200 < alpha) continue;
+#ifndef NO_SEE
+            if (L.sc[i] < -100000) continue;            /* captura perdedora segun SEE */
+#else
+            int att = TYPE(p->mb[MFROM(m)]);
             if (VAL[att] > VAL[victim] + 50 && attacked(p, MTO(m), them)) continue;
+#endif
         }
         if (!make_legal(p, m)) continue;
+        pm[ply + 1] = m;
         int score = -qsearch(p, -beta, -alpha, ply + 1);
         unmake_move(p, m);
         if (stop_flag) return 0;
         if (score > best) {
             best = score;
+            best_move = m;
             if (score > alpha) {
                 alpha = score;
                 if (alpha >= beta) break;
             }
         }
     }
+#ifndef NO_QTT
+    {
+        int flag = (best <= orig_alpha) ? UPPER : (best >= beta) ? LOWER : EXACT;
+        int stored = best;
+        if (stored > MATE_BOUND) stored += ply; else if (stored < -MATE_BOUND) stored -= ply;
+        if (e->key != p->key || e->depth <= 0) {
+            Move old = (e->key == p->key) ? e->move : 0;
+            e->key = p->key;
+            e->move = best_move ? best_move : old;
+            e->score = (int16_t)stored;
+            e->depth = 0;
+            e->fa = (uint8_t)(flag | (tt_age << 2));
+        }
+    }
+#endif
     return best;
 }
 
@@ -841,6 +947,7 @@ static int search(Pos *p, int depth, int alpha, int beta, int ply, int allow_nul
             (p->occ[us] & ~(p->bb[PC(us, PAWN)] | p->bb[PC(us, KING)]))) {
             int R = 3 + depth / 4 + ((stat - beta) / 200 > 3 ? 3 : (stat - beta) / 200);
             make_null(p);
+            pm[ply + 1] = 0;
             int s = -search(p, depth - 1 - R, -beta, -beta + 1, ply + 1, 0);
             unmake_null(p);
             if (stop_flag) return 0;
@@ -860,6 +967,12 @@ static int search(Pos *p, int depth, int alpha, int beta, int ply, int allow_nul
     for (int i = 0; i < L.n; i++) {
         Move m = pick(&L, i);
         int quiet = !is_capture(p, m) && !MPROMO(m);
+#ifndef NO_SEEPRUNE
+        if (!pv && !chk && legal > 0 && best > -MATE_BOUND && depth <= 5 && m != ttm && !MPROMO(m)) {
+            if (!quiet) { if (!see_ge(p, m, -80 * depth)) continue; }
+            else if (depth <= 4 && !see_ge(p, m, -25 * depth * depth)) continue;
+        }
+#endif
         if (!make_legal(p, m)) continue;
         legal++;
         int gives = in_check(p);
@@ -870,6 +983,7 @@ static int search(Pos *p, int depth, int alpha, int beta, int ply, int allow_nul
         }
 
         int newd = depth - 1, score;
+        pm[ply + 1] = m;
         if (legal == 1) {
             score = -search(p, newd, -beta, -alpha, ply + 1, 1);
         } else {
@@ -879,6 +993,9 @@ static int search(Pos *p, int depth, int alpha, int beta, int ply, int allow_nul
                 if (pv) r--;
                 if (improving) r--;
                 if (m == killers[ply][0] || m == killers[ply][1]) r--;
+#ifndef NO_HLMR
+                r -= history[us][MFROM(m)][MTO(m)] / 5000;
+#endif
                 if (r > newd - 1) r = newd - 1;
                 if (r < 0) r = 0;
             }
@@ -898,6 +1015,7 @@ static int search(Pos *p, int depth, int alpha, int beta, int ply, int allow_nul
                 if (alpha >= beta) {
                     if (quiet) {
                         if (killers[ply][0] != m) { killers[ply][1] = killers[ply][0]; killers[ply][0] = m; }
+                        if (ply > 0 && pm[ply]) counter_mv[MFROM(pm[ply])][MTO(pm[ply])] = m;
                         int bonus = depth * depth;
                         if (bonus > 1600) bonus = 1600;
                         hist_update(us, m, bonus);
@@ -917,7 +1035,7 @@ static int search(Pos *p, int depth, int alpha, int beta, int ply, int allow_nul
     if (stored > MATE_BOUND) stored += ply; else if (stored < -MATE_BOUND) stored -= ply;
     if (e->key != p->key || (e->fa >> 2) != tt_age || depth >= e->depth - 2 || flag == EXACT) {
         e->key = p->key;
-        e->move = best_move ? best_move : (e->key == p->key ? e->move : 0);
+        e->move = best_move;
         e->score = (int16_t)stored;
         e->depth = (int8_t)(depth > 127 ? 127 : depth);
         e->fa = (uint8_t)(flag | (tt_age << 2));
@@ -926,6 +1044,7 @@ static int search(Pos *p, int depth, int alpha, int beta, int ply, int allow_nul
 }
 
 static void print_info(int depth, int score, double elapsed) {
+    if (silent) return;
     char mv[8];
     move_str(root_best, mv);
     long long nps = elapsed > 0.001 ? (long long)(nodes / elapsed) : nodes;
@@ -951,6 +1070,7 @@ static void think(Pos *p, double soft, double hard, int maxd, long long maxnodes
     tt_age = (tt_age + 1) & 63;
     for (int s = 0; s < 2; s++) for (int a = 0; a < 64; a++) for (int b = 0; b < 64; b++) history[s][a][b] /= 2;
     memset(killers, 0, sizeof killers);
+    pm[0] = 0;
 
     MList L;
     gen(p, &L, 0);
@@ -987,8 +1107,7 @@ static void think(Pos *p, double soft, double hard, int maxd, long long maxnodes
     }
     /* en modo infinite esperamos al 'stop' si la busqueda termino antes */
     move_str(root_best, mv);
-    printf("bestmove %s\n", mv);
-    fflush(stdout);
+    if (!silent) { printf("bestmove %s\n", mv); fflush(stdout); }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1024,6 +1143,7 @@ static void new_game(void) {
     memset(tt, 0, (tt_mask + 1) * sizeof(TTEntry));
     memset(history, 0, sizeof history);
     memset(killers, 0, sizeof killers);
+    memset(counter_mv, 0, sizeof counter_mv);
     tt_age = 0;
 }
 
@@ -1086,9 +1206,42 @@ static void cmd_go(Pos *p, char *args) {
     think(p, soft, hard, depth, nodes_lim, inf_mode);
 }
 
-int main(void) {
+static void run_bench(int depth) {
+    static const char *fens[] = {
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        "r1bq1rk1/pp2ppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/R3KB1R w KQ - 0 9",
+        "r2q1rk1/ppp2ppp/2n1bn2/3p4/3P4/2N1PN2/PP2BPPP/R2Q1RK1 w - - 0 1",
+        "4r1k1/5ppp/8/3P4/2P1P3/8/R4PPP/6K1 w - - 0 1",
+        "8/pp3k2/2p1p3/3pP1p1/3P1PP1/2P5/PP4K1/8 b - - 0 1",
+        "6k1/5p2/8/8/8/5P2/5K2/4R3 w - - 0 1",
+        "r1b2rk1/2q1bppp/p2p1n2/np2p3/3NP3/1BN1B3/PPP1QPPP/2KR3R w - - 0 1"
+    };
+    Pos bp;
+    long long total = 0;
+    double t0 = now_s();
+    silent = 1; poll_stdin = 0;
+    for (size_t i = 0; i < sizeof fens / sizeof *fens; i++) {
+        set_fen(&bp, fens[i]);
+        memset(tt, 0, (tt_mask + 1) * sizeof(TTEntry));
+        memset(history, 0, sizeof history); memset(counter_mv, 0, sizeof counter_mv);
+        think(&bp, 1e9, 1e9, depth, 0, 0);
+        total += nodes;
+    }
+    double el = now_s() - t0;
+    silent = 0;
+    printf("bench depth %d nodes %lld time %.3f nps %lld\n", depth, total, el, (long long)(total / (el > 0 ? el : 1)));
+    fflush(stdout);
+}
+
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     init_all();
+    if (argc > 1 && !strcmp(argv[1], "bench")) { run_bench(argc > 2 ? atoi(argv[2]) : 11); return 0; }
     Pos pos;
     set_fen(&pos, STARTFEN);
     char line[16384];
@@ -1122,8 +1275,19 @@ int main(void) {
         } else if (!strcmp(line, "quit")) {
             break;
         } else if (!strcmp(line, "d")) {
-            printf("key %llx side %d castle %d ep %d half %d eval %d\n",
-                   (unsigned long long)pos.key, pos.side, pos.castle, pos.ep, pos.half, evaluate(&pos));
+            printf("key %llx side %d castle %d ep %d half %d eval %d check %d\n",
+                   (unsigned long long)pos.key, pos.side, pos.castle, pos.ep, pos.half, evaluate(&pos), in_check(&pos));
+        } else if (!strncmp(line, "see ", 4)) {
+            Move sm = parse_move(&pos, line + 4);
+            int lo = -3000, hi = 3000;
+            while (lo < hi) { int mid = (lo + hi + 1) / 2; if (see_ge(&pos, sm, mid)) lo = mid; else hi = mid - 1; }
+            printf("see %d\n", sm ? lo : -9999);
+        } else if (!strcmp(line, "moves")) {
+            MList ml; gen(&pos, &ml, 0);
+            printf("moves");
+            for (int i = 0; i < ml.n; i++)
+                if (make_legal(&pos, ml.m[i])) { unmake_move(&pos, ml.m[i]); char ms[8]; move_str(ml.m[i], ms); printf(" %s", ms); }
+            printf("\n");
         }
         fflush(stdout);
     }
