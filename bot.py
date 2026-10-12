@@ -14,6 +14,10 @@ import shutil
 import subprocess
 import threading
 import datetime
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import chess
 import chess.engine
@@ -47,6 +51,11 @@ CHALLENGE_INTERVAL = int(os.environ.get("CHALLENGE_INTERVAL", "90"))        # s 
 MAX_CHALLENGES_PER_HOUR = int(os.environ.get("MAX_CHALLENGES_PER_HOUR", "20"))
 BOT_LIST_TTL = int(os.environ.get("BOT_LIST_TTL", "300"))                    # s de caché de la lista de bots
 LOG_ENGINE = os.environ.get("LOG_ENGINE", "1") == "1"        # mostrar prof/eval/nodos en los logs
+# Tablebases (API de Lichess: sin archivos, sin RAM, hasta 7 piezas)
+TABLEBASE = os.environ.get("TABLEBASE", "1") == "1"
+TB_MAX_PIECES = int(os.environ.get("TB_MAX_PIECES", "7"))
+TB_TIMEOUT = float(os.environ.get("TB_TIMEOUT", "1.5"))       # s máximos por consulta
+TB_MIN_CLOCK_MS = int(os.environ.get("TB_MIN_CLOCK_MS", "3000"))  # con menos reloj no consulta
 BOOK_MAX_FULLMOVES = 12
 
 
@@ -98,10 +107,39 @@ def ensure_engine():
     return None
 
 
+DECISIVE = ("win", "cursed-win", "loss", "blessed-loss")
+
+
+def tb_choice(data):
+    """Interpreta la respuesta de la API de tablebases de Lichess.
+
+    Devuelve:
+      ("play", uci)        -> posición ganada/perdida: jugar la mejor jugada de las tablas
+      ("draw", set_de_uci) -> posición de tablas: el motor decide, pero solo se admiten
+                              jugadas que mantengan las tablas
+      None                 -> sin información útil: que decida el motor
+    Nota: la categoría de cada jugada está vista desde el rival (tras mover le toca a él).
+    """
+    if not data:
+        return None
+    cat = data.get("category")
+    moves = data.get("moves") or []
+    if not moves:
+        return None
+    if cat in DECISIVE:
+        return ("play", moves[0]["uci"])        # la API ordena de mejor a peor
+    if cat == "draw":
+        draws = {m["uci"] for m in moves if m.get("category") == "draw"}
+        return ("draw", draws) if draws else None
+    return None
+
+
 class Brain:
     def __init__(self):
         self.lock = threading.Lock()
         self.engine = None
+        self.tb_cache = {}
+        self.tb_block_until = 0.0
         self.path = ensure_engine()
         if not self.path:
             raise SystemExit("❌ No hay binario del motor (mackengine) ni gcc para compilarlo.")
@@ -160,6 +198,52 @@ class Brain:
         except Exception:
             pass
 
+    def _tb_fetch(self, board):
+        """Consulta la API de tablebases de Lichess. Devuelve el JSON o None (nunca lanza)."""
+        if not TABLEBASE or board.castling_rights:
+            return None
+        if len(board.piece_map()) > TB_MAX_PIECES:
+            return None
+        if time.time() < self.tb_block_until:
+            return None
+        key = board.fen()
+        if key in self.tb_cache:
+            return self.tb_cache[key]
+        url = "https://tablebase.lichess.ovh/standard?" + urllib.parse.urlencode({"fen": key})
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "MackBot (Lichess bot)"})
+            with urllib.request.urlopen(req, timeout=TB_TIMEOUT) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                self.tb_block_until = time.time() + 60
+                log("⏳ Tablebase: demasiadas consultas (429), pausa de 60 s.")
+            else:
+                log(f"   (tablebase HTTP {e.code})")
+            return None
+        except Exception as e:
+            log(f"   (tablebase no disponible: {e})")
+            return None
+        if len(self.tb_cache) > 2000:
+            self.tb_cache.clear()
+        self.tb_cache[key] = data
+        return data
+
+    def _engine_move(self, board, limit, game_id):
+        for _ in range(2):
+            try:
+                if self.engine is None:
+                    self._start_engine()
+                if self.engine is not None:
+                    res = self.engine.play(board, limit, game=game_id, info=chess.engine.INFO_ALL)
+                    if res.move and res.move in board.legal_moves:
+                        self._log_info(res.info)
+                        return res.move
+            except Exception as e:
+                log(f"⚠️  El motor falló ({e}); reiniciándolo.")
+                self._kill_engine()
+        return None
+
     def choose(self, board, wtime, btime, winc, binc, game_id=None):
         bm = self.book_move(board)
         if bm and bm in board.legal_moves:
@@ -171,6 +255,22 @@ class Brain:
             log("  ♟️  jugada única")
             return legal[0]
 
+        # --- tablebases (solo si queda reloj de sobra para la consulta) ---
+        my_clock = wtime if board.turn == chess.WHITE else btime
+        tb = tb_dec = None
+        if my_clock is None or my_clock >= TB_MIN_CLOCK_MS:
+            tb = self._tb_fetch(board)
+            tb_dec = tb_choice(tb)
+            if tb_dec and tb_dec[0] == "play":
+                try:
+                    mv = chess.Move.from_uci(tb_dec[1])
+                except ValueError:
+                    mv = None
+                if mv and mv in board.legal_moves:
+                    dtz = tb.get("dtz")
+                    log(f"  🧩 tablebase: {tb.get('category')}" + (f" (dtz {dtz})" if dtz is not None else ""))
+                    return mv
+
         wt = (wtime if wtime is not None else 60000) / 1000.0
         bt = (btime if btime is not None else 60000) / 1000.0
         limit = chess.engine.Limit(
@@ -178,20 +278,18 @@ class Brain:
             white_inc=(winc or 0) / 1000.0, black_inc=(binc or 0) / 1000.0)
 
         with self.lock:
-            for _ in range(2):
-                try:
-                    if self.engine is None:
-                        self._start_engine()
-                    if self.engine is not None:
-                        res = self.engine.play(board, limit, game=game_id, info=chess.engine.INFO_ALL)
-                        if res.move and res.move in board.legal_moves:
-                            self._log_info(res.info)
-                            return res.move
-                except Exception as e:
-                    log(f"⚠️  El motor falló ({e}); reiniciándolo.")
-                    self._kill_engine()
-        log("⚠️  Sin respuesta del motor: jugada de emergencia.")
-        return random.choice(legal)
+            mv = self._engine_move(board, limit, game_id)
+        if mv is None:
+            log("⚠️  Sin respuesta del motor: jugada de emergencia.")
+            return random.choice(legal)
+
+        # tablas teóricas: el motor puede buscar ganar, pero sin tirar el medio punto
+        if tb_dec and tb_dec[0] == "draw" and mv.uci() not in tb_dec[1]:
+            fix = next((m["uci"] for m in tb["moves"] if m.get("category") == "draw"), None)
+            if fix:
+                log(f"  🛡️  tablebase corrige {mv.uci()} -> {fix} (mantiene las tablas)")
+                return chess.Move.from_uci(fix)
+        return mv
 
 
 def speed_of(limit, inc):
